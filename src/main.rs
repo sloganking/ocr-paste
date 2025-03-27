@@ -1,21 +1,33 @@
-use anyhow::{anyhow, Context, Result};
-use clap::Parser;
-use clipboard_win::{formats, set_clipboard, set_clipboard_string};
-use image::ImageFormat;
-use rdev::{listen, simulate, Event, EventType, Key}; // Keep rdev::Key import
-use std::fs;
-use std::path::Path;
-use std::process::Command;
-use std::thread;
-use std::time::Duration;
+// src/main.rs
 
-// --- Import the new module and enum ---
+use anyhow::{anyhow, Context as AnyhowContext, Result};
+use clap::Parser;
+use clipboard_win::{formats, get_clipboard, Setter};
+use dotenvy; // <-- Import dotenvy
+
+use image::ImageFormat;
+use rdev::{listen, simulate, Event, EventType, Key};
+use std::{
+    env, // Keep env for manual var reading as fallback/confirmation
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
+    time::Duration,
+};
+
 mod easy_rdev_key;
 use easy_rdev_key::PTTKey;
+mod transcribe;
 
-// --- REMOVE lazy_static and KEY_MAP ---
-// lazy_static::lazy_static! { ... } // DELETE THIS BLOCK
-// fn string_to_rdev_key(...) { ... } // DELETE THIS FUNCTION
+use async_openai::{config::OpenAIConfig, Client};
+use tokio::runtime::Runtime;
+
+const AUDIO_EXTENSIONS: &[&str] = &[
+    "wav", "mp3", "m4a", "ogg", "flac", "aac", "wma", "opus", "aiff", "aif",
+];
+
+const CLIPBRD_E_UNSUPPORTEDFORMAT: i32 = -2147221040; // 0x800401D0
 
 // --- CLI Arguments ---
 #[derive(Parser, Debug)]
@@ -23,18 +35,17 @@ use easy_rdev_key::PTTKey;
     author,
     version,
     about,
-    long_about = "Listens for a key press, performs OCR on clipboard image via Tesseract CLI, pastes text, restores image."
+    long_about = "Listens for a key press, processes clipboard content (image OCR or audio transcription), pastes text, and restores original clipboard."
 )]
 struct Args {
-    // --- Use PTTKey for trigger_key ---
-    #[arg(short, long, value_enum, help = "Key to trigger OCR.")]
-    trigger_key: PTTKey, // Changed from String to PTTKey
+    #[arg(short, long, value_enum, help = "Key to trigger processing.")]
+    trigger_key: PTTKey,
 
     #[arg(
-        short,
+        short = 'l',
         long,
         default_value = "eng",
-        help = "Tesseract language code(s) (e.g., 'eng', 'eng+fra'). Passed via '-l'."
+        help = "Tesseract language code(s) (e.g., 'eng', 'eng+fra') for OCR. Passed via '-l'."
     )]
     lang: String,
 
@@ -51,126 +62,243 @@ struct Args {
     )]
     tessdata_path: Option<String>,
 
-    #[arg(long, help = "Additional arguments to pass directly to the Tesseract CLI.", num_args = 0..)]
+    #[arg(
+        long,
+        help = "Additional arguments to pass directly to the Tesseract CLI.",
+        num_args = 0..
+    )]
     tesseract_args: Vec<String>,
+
+    // --- OpenAI API Key (CLI arg is optional, .env is checked first) ---
+    #[arg(
+        long,
+        help = "OpenAI API Key (overrides .env or OPENAI_API_KEY env var)."
+    )]
+    openai_api_key: Option<String>,
 }
 
-// --- Core OCR and Paste Logic (No changes needed inside this function) ---
-fn perform_ocr_and_paste(
-    lang: &str,
-    tesseract_cmd: &str,
-    tessdata_path: Option<&str>,
-    extra_args: &[String],
-) -> Result<()> {
-    println!("Trigger key pressed. Processing clipboard image...");
+#[derive(Debug)]
+enum ClipboardContent {
+    Bitmap(Vec<u8>),
+    FileList(Vec<String>),
+}
 
-    // 1. Backup clipboard
-    let clipboard_dib_content = clipboard_win::get_clipboard(formats::Bitmap)
-        .map_err(|e| anyhow!("Failed to get bitmap from clipboard: {}", e))
-        .context("Is an image (Bitmap format) copied to the clipboard?")?;
-    println!(
-        "Got bitmap data ({} bytes) from clipboard.",
-        clipboard_dib_content.len()
-    );
-
-    // 2. Prepare temp file
-    let temp_dir = std::env::temp_dir();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let temp_image_filename = format!("clipboard_ocr_{}_{}.png", std::process::id(), timestamp);
-    let temp_image_path = temp_dir.join(&temp_image_filename);
-
-    struct TempFileGuard<'a>(&'a Path);
-    impl Drop for TempFileGuard<'_> {
-        fn drop(&mut self) {
-            if self.0.exists() {
-                if let Err(e) = fs::remove_file(self.0) {
-                    eprintln!(
-                        "Warning: Failed to delete temporary file {:?}: {}",
-                        self.0, e
-                    );
-                } else {
-                    println!("Temporary file {:?} deleted.", self.0);
-                }
+fn get_clipboard_content() -> Result<ClipboardContent> {
+    match get_clipboard::<Vec<String>, _>(formats::FileList) {
+        Ok(files) => {
+            println!("Clipboard contains FileList: {:?}", files);
+            return Ok(ClipboardContent::FileList(files));
+        }
+        Err(e) => {
+            if e.raw_code() != CLIPBRD_E_UNSUPPORTEDFORMAT {
+                println!(
+                    "Warning: Failed to get FileList for unexpected reason (Error {}): {}. Trying Bitmap.",
+                    e.raw_code(), e
+                );
+            } else {
+                println!("Clipboard does not contain FileList format. Trying Bitmap.");
             }
         }
     }
-    let _temp_file_guard = TempFileGuard(&temp_image_path);
 
-    // 3. Save image to temp file
-    {
-        let img = image::load_from_memory_with_format(&clipboard_dib_content, ImageFormat::Bmp)
-            .context("Failed to decode clipboard DIB data as BMP.")?;
-        println!(
-            "Decoded image. Saving temporary file to {:?}",
-            temp_image_path
-        );
-        img.save_with_format(&temp_image_path, ImageFormat::Png)
-            .with_context(|| {
-                format!(
-                    "Failed to save temporary PNG image to {:?}",
-                    temp_image_path
-                )
-            })?;
-        println!("Temporary image saved.");
+    match get_clipboard::<Vec<u8>, _>(formats::Bitmap) {
+        Ok(bitmap_data) => {
+            println!(
+                "Clipboard contains Bitmap data ({} bytes).",
+                bitmap_data.len()
+            );
+            return Ok(ClipboardContent::Bitmap(bitmap_data));
+        }
+        Err(e) => {
+            if e.raw_code() != CLIPBRD_E_UNSUPPORTEDFORMAT {
+                println!(
+                    "Warning: Failed to get Bitmap for unexpected reason (Error {}): {}",
+                    e.raw_code(),
+                    e
+                );
+            } else {
+                println!("Clipboard does not contain Bitmap format either.");
+            }
+            return Err(anyhow!("Failed to get Bitmap from clipboard: {}", e));
+        }
     }
-
-    // 4. Run Tesseract CLI
-    println!("Running Tesseract CLI...");
-    let mut command = Command::new(tesseract_cmd);
-    // ... (rest of command setup is the same) ...
-    command.arg(&temp_image_path);
-    command.arg("stdout");
-    command.arg("-l").arg(lang);
-    if let Some(tessdata) = tessdata_path {
-        command.arg("--tessdata-dir").arg(tessdata);
-    }
-    for arg in extra_args {
-        command.arg(arg);
-    }
-
-    let output = command
-        .output()
-        .with_context(|| format!("Failed Tesseract command: '{}'", tesseract_cmd))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "Tesseract CLI failed ({}):\n{}",
-            output.status,
-            stderr
-        ));
-    }
-    let ocr_text = String::from_utf8(output.stdout)?;
-
-    // 5. Process OCR text
-    let trimmed_text = ocr_text.trim();
-    if trimmed_text.is_empty() {
-        println!("OCR resulted in empty text. Skipping paste.");
-        return Ok(());
-    }
-    println!("OCR Result (first 100 chars): {:.100}...", trimmed_text);
-
-    // 6. Paste Text
-    set_clipboard_string(trimmed_text)
-        .map_err(|e| anyhow!("Failed clipboard set string: {}", e))
-        .context("Failed to place OCR text onto clipboard")?;
-    println!("OCR text placed on clipboard. Simulating paste (Ctrl+V)...");
-    thread::sleep(Duration::from_millis(150));
-    send_ctrl_v().context("Failed to simulate Ctrl+V paste")?;
-
-    // 7. Restore Original Image
-    thread::sleep(Duration::from_millis(150));
-    set_clipboard(formats::Bitmap, &clipboard_dib_content)
-        .map_err(|e| anyhow!("Failed clipboard set bitmap: {}", e))
-        .context("Failed to restore original bitmap to clipboard")?;
-    println!("Original image restored to clipboard.");
-
-    Ok(())
 }
 
-// Helper function to simulate Ctrl+V (Keep as is)
+fn restore_clipboard(content: ClipboardContent) -> Result<()> {
+    match content {
+        ClipboardContent::Bitmap(data) => {
+            println!("Restoring Bitmap to clipboard...");
+            formats::Bitmap
+                .write_clipboard(&data)
+                .map_err(|e| anyhow!("Failed to restore Bitmap to clipboard: {}", e))
+        }
+        ClipboardContent::FileList(files) => {
+            println!("Restoring FileList to clipboard...");
+            formats::FileList
+                .write_clipboard(&files)
+                .map_err(|e| anyhow!("Failed to restore FileList to clipboard: {}", e))
+        }
+    }
+}
+
+fn process_clipboard_and_paste(
+    original_content: ClipboardContent, // Takes ownership
+    args: &Args,                        // Now contains key from arg OR env
+    rt: &Runtime,
+) -> Result<()> {
+    let processed_text_result = match &original_content {
+        ClipboardContent::FileList(files) => {
+            if files.len() == 1 {
+                let file_path = PathBuf::from(&files[0]);
+                let extension = file_path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_lowercase())
+                    .unwrap_or_default();
+
+                if AUDIO_EXTENSIONS.contains(&extension.as_str()) {
+                    println!("Detected single audio file: {:?}", file_path);
+                    // API key should be present in args.openai_api_key if found via arg or .env/env var
+                    let api_key = args.openai_api_key.as_ref().ok_or_else(|| {
+                        // This error should ideally not happen if logic in main is correct,
+                        // but keep it as a safeguard.
+                        anyhow!("OpenAI API Key is missing (checked arg, .env, env var).")
+                    })?;
+                    println!("INFO: Audio transcription requires ffmpeg to be installed and in your PATH.");
+
+                    let config = OpenAIConfig::new().with_api_key(api_key);
+                    let client = Client::with_config(config);
+
+                    rt.block_on(transcribe::trans::transcribe(&client, &file_path))
+                        .with_context(|| {
+                            format!("Audio transcription failed for file: {:?}", file_path)
+                        })
+                } else {
+                    Err(anyhow!(
+                         "Clipboard contains a single file, but it's not a supported audio format (Checked: {:?}, Ext: {}).",
+                         AUDIO_EXTENSIONS, extension
+                     ))
+                }
+            } else {
+                Err(anyhow!(
+                     "Clipboard contains {} files. Only single audio file transcription is supported.",
+                     files.len()
+                 ))
+            }
+        }
+        ClipboardContent::Bitmap(bitmap_data) => {
+            println!("Processing clipboard image with Tesseract OCR...");
+            let temp_dir = std::env::temp_dir();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis();
+            let temp_image_filename =
+                format!("clipboard_ocr_{}_{}.png", std::process::id(), timestamp);
+            let temp_image_path = temp_dir.join(&temp_image_filename);
+
+            struct TempFileGuard<'a>(&'a Path);
+            impl Drop for TempFileGuard<'_> {
+                fn drop(&mut self) {
+                    if self.0.exists() {
+                        if let Err(e) = fs::remove_file(self.0) {
+                            eprintln!(
+                                "Warning: Failed to delete temporary image file {:?}: {}",
+                                self.0, e
+                            );
+                        } else {
+                            println!("Temporary image file {:?} deleted.", self.0);
+                        }
+                    }
+                }
+            }
+            let _temp_file_guard = TempFileGuard(&temp_image_path);
+
+            let img = image::load_from_memory(bitmap_data)
+                .with_context(|| "Failed to decode clipboard image data")?;
+            println!(
+                "Decoded image. Saving temporary PNG to {:?}",
+                temp_image_path
+            );
+            img.save_with_format(&temp_image_path, ImageFormat::Png)
+                .with_context(|| {
+                    format!(
+                        "Failed to save temporary PNG image to {:?}",
+                        temp_image_path
+                    )
+                })?;
+            println!("Temporary image saved.");
+
+            println!("Running Tesseract CLI...");
+            let mut command = Command::new(&args.tesseract_cmd);
+            command.arg(&temp_image_path);
+            command.arg("stdout");
+            command.arg("-l").arg(&args.lang);
+            if let Some(tessdata) = &args.tessdata_path {
+                command.arg("--tessdata-dir").arg(tessdata);
+            }
+            for arg in &args.tesseract_args {
+                command.arg(arg);
+            }
+
+            let output = command.output().with_context(|| {
+                format!(
+                    "Failed to execute Tesseract command: '{}'",
+                    args.tesseract_cmd
+                )
+            })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(anyhow!(
+                    "Tesseract CLI failed (Status: {}):\n{}",
+                    output.status,
+                    stderr
+                ))
+            } else {
+                String::from_utf8(output.stdout)
+                    .with_context(|| "Tesseract output was not valid UTF-8")
+            }
+        }
+    };
+
+    match processed_text_result {
+        Ok(processed_text) => {
+            let trimmed_text = processed_text.trim();
+            if trimmed_text.is_empty() {
+                println!("Processing resulted in empty text. Skipping paste.");
+                restore_clipboard(original_content).with_context(|| {
+                    "Failed to restore original clipboard content after empty result"
+                })?;
+                Ok(())
+            } else {
+                println!("Processed Text (first 100 chars): {:.100}...", trimmed_text);
+
+                set_clipboard_string_helper(trimmed_text)
+                    .with_context(|| "Failed to place processed text onto clipboard")?;
+                println!("Processed text placed on clipboard. Simulating paste (Ctrl+V)...");
+                thread::sleep(Duration::from_millis(150));
+                send_ctrl_v().context("Failed to simulate Ctrl+V paste")?;
+
+                thread::sleep(Duration::from_millis(150));
+                restore_clipboard(original_content)
+                    .with_context(|| "Failed to restore original content to clipboard")?;
+                println!("Original clipboard content restored.");
+                Ok(())
+            }
+        }
+        Err(e) => {
+            eprintln!("ERROR processing clipboard content: {:?}", e);
+            if let Err(restore_err) = restore_clipboard(original_content) {
+                eprintln!(
+                    "Additionally failed to restore clipboard: {:?}",
+                    restore_err
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
 fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     let delay = Duration::from_millis(30);
     simulate(&EventType::KeyPress(Key::ControlLeft))?;
@@ -186,64 +314,116 @@ fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
 
 // --- Main Function ---
 fn main() -> Result<()> {
-    let args = Args::parse();
+    // --- Load .env file BEFORE parsing args ---
+    // Ignore errors (e.g., if .env file is missing)
+    match dotenvy::dotenv() {
+        Ok(path) => println!("Loaded environment variables from: {:?}", path),
+        Err(e) => {
+            // Don't fail if .env is missing, but maybe warn if it failed unexpectedly
+            if !e.not_found() {
+                eprintln!("Warning: Failed to load .env file: {}", e);
+            } else {
+                println!("No .env file found, proceeding without it.");
+            }
+        }
+    };
 
-    // --- Convert PTTKey to rdev::Key using the From trait ---
-    // No need for error handling here, clap already validated the input.
+    // --- Parse Arguments ---
+    // Make args mutable so we can potentially update openai_api_key
+    let mut args = Args::parse();
+
+    // --- Check/Load API Key (Priority: Argument > Environment Variable) ---
+    if args.openai_api_key.is_none() {
+        println!("--openai-api-key argument not provided, checking OPENAI_API_KEY environment variable (loaded from system or .env)...");
+        // This will read the variable set by dotenvy OR the system environment
+        match env::var("OPENAI_API_KEY") {
+            Ok(key_from_env) => {
+                if !key_from_env.is_empty() {
+                    println!("Using OpenAI API Key found in environment variable.");
+                    args.openai_api_key = Some(key_from_env);
+                } else {
+                    println!("OPENAI_API_KEY environment variable is set but empty.");
+                }
+            }
+            Err(_) => {
+                println!("OPENAI_API_KEY environment variable not found or not set.");
+            }
+        }
+    } else {
+        println!("Using OpenAI API Key provided via command-line argument.");
+    }
+    // --- End API Key Check ---
+
+    let rt = Runtime::new().context("Failed to create Tokio runtime")?;
     let target_key: rdev::Key = args.trigger_key.into();
 
-    // Clone data needed for the closure
-    let lang = args.lang.clone();
-    let tesseract_cmd = args.tesseract_cmd.clone();
-    let tessdata_path_opt = args.tessdata_path.clone();
-    let extra_args = args.tesseract_args.clone();
-
-    println!("Clipboard OCR Listener Started (Using Tesseract CLI).");
-    // --- Use {:?} for the PTTKey enum ---
+    // --- Startup Information ---
+    println!("Clipboard Processor Started.");
     println!(
         "Trigger Key: {:?} (Converted to {:?})",
         args.trigger_key, target_key
     );
-    println!("OCR Language: '{}'", lang);
-    println!("Tesseract Command: '{}'", tesseract_cmd);
+    println!("--- Modes ---");
+    println!(
+        " > Image OCR: Lang='{}', Tesseract='{}'",
+        args.lang, args.tesseract_cmd
+    );
     if let Some(p) = &args.tessdata_path {
-        println!("Tessdata Path: '{}'", p);
+        println!("   Tessdata: '{}'", p);
     }
-    if !extra_args.is_empty() {
-        println!("Extra Tesseract Args: {:?}", extra_args);
+    if !args.tesseract_args.is_empty() {
+        println!("   Extra Tesseract Args: {:?}", args.tesseract_args);
+    }
+    // Check the potentially updated args.openai_api_key
+    if args.openai_api_key.is_some() {
+        println!(" > Audio Transcription: Enabled (Whisper API)");
+        println!("   Requires: ffmpeg in PATH, valid API Key.");
+    } else {
+        // Make message more informative
+        println!(" > Audio Transcription: Disabled (API Key not provided via arg or found in .env/environment)");
     }
     println!("---");
-    // --- Update help message ---
     println!(
-        "Press '{:?}' when an image is in the clipboard to perform OCR and paste.",
+        "Press '{:?}' when an image OR a single audio file is in the clipboard to process.",
         args.trigger_key
     );
     println!(
-        "Ensure Tesseract CLI ('{}') is installed and accessible.",
-        tesseract_cmd
+        "NOTE: This program likely requires administrator privileges for global key listening."
     );
-    println!(
-        "Ensure '{}' language data is available (use --tessdata-path if needed).",
-        lang
-    );
-    println!("NOTE: This program likely requires administrator privileges.");
     println!("Ctrl+C in this window to exit.");
     println!("---");
 
+    // Clone args for the callback closure
+    let args_clone = {
+        Args {
+            trigger_key: args.trigger_key,
+            lang: args.lang.clone(),
+            tesseract_cmd: args.tesseract_cmd.clone(),
+            tessdata_path: args.tessdata_path.clone(),
+            tesseract_args: args.tesseract_args.clone(),
+            openai_api_key: args.openai_api_key.clone(), // Clone the potentially updated key
+        }
+    };
+
     let callback = move |event: Event| {
-        match event.event_type {
-            // --- Comparison still works, as target_key is now rdev::Key ---
-            EventType::KeyPress(key) if key == target_key => {
-                if let Err(e) = perform_ocr_and_paste(
-                    &lang,
-                    &tesseract_cmd,
-                    tessdata_path_opt.as_deref(),
-                    &extra_args,
-                ) {
-                    eprintln!("ERROR: {:?}", e);
+        if let EventType::KeyPress(key) = event.event_type {
+            if key == target_key {
+                println!("\n--- Trigger key pressed! ---");
+                match get_clipboard_content() {
+                    Ok(original_content) => {
+                        // Pass the cloned args which contain the resolved API key
+                        if let Err(e) =
+                            process_clipboard_and_paste(original_content, &args_clone, &rt)
+                        {
+                            eprintln!("ERROR during clipboard processing/restoration: {:?}", e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR getting clipboard content: {:?}", e);
+                    }
                 }
+                println!("--- Ready for next trigger ---");
             }
-            _ => (),
         }
     };
 
@@ -253,8 +433,13 @@ fn main() -> Result<()> {
             error
         );
         eprintln!("This might be a permissions issue. Try running as administrator.");
-        return Err(anyhow!("Keyboard listener error: {:?}", error));
+        return Err(anyhow!("Keyboard listener setup failed: {:?}", error));
     }
 
     Ok(())
+}
+
+fn set_clipboard_string_helper(text: &str) -> Result<()> {
+    clipboard_win::set_clipboard_string(text)
+        .map_err(|e| anyhow!("Failed to set clipboard string: {}", e))
 }

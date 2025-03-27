@@ -10,3 +10,10 @@ clipboard-win = "5.4.0"
 image = "0.25.6"
 lazy_static = "1.5.0"
 rdev = "0.5.3"
+
+async-openai = "0.28.0" # Check for latest version
+tokio = { version = "1", features = [
+    "full",
+] } # Use "full" or "rt-multi-thread", "macros"
+tempfile = "3.10.1"
+dotenvy = "0.15.7"
