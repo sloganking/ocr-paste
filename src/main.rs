@@ -2,19 +2,27 @@
 
 use anyhow::{anyhow, Context as AnyhowContext, Result};
 use clap::Parser;
-use clipboard_win::{formats, get_clipboard, Setter};
-use dotenvy; // <-- Import dotenvy
+// Add Clipboard back for explicit open
+use clipboard_win::{
+    formats,
+    get_clipboard,
+    Clipboard, // <-- Add this back
+    Setter,
+};
+use dotenvy;
 
 use image::ImageFormat;
 use rdev::{listen, simulate, Event, EventType, Key};
 use std::{
-    env, // Keep env for manual var reading as fallback/confirmation
-    fs,
-    path::{Path, PathBuf},
+    env,
+    // Remove unused fs and Path
+    // fs,
+    path::PathBuf,
     process::Command,
     thread,
     time::Duration,
 };
+use tempfile::Builder as TempFileBuilder;
 
 mod easy_rdev_key;
 use easy_rdev_key::PTTKey;
@@ -26,54 +34,32 @@ use tokio::runtime::Runtime;
 const AUDIO_EXTENSIONS: &[&str] = &[
     "wav", "mp3", "m4a", "ogg", "flac", "aac", "wma", "opus", "aiff", "aif",
 ];
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "mpeg", "mpg", "m4v", "3gp",
+];
 
-const CLIPBRD_E_UNSUPPORTEDFORMAT: i32 = -2147221040; // 0x800401D0
+const CLIPBRD_E_UNSUPPORTEDFORMAT: i32 = -2147221040;
 
 // --- CLI Arguments ---
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about,
-    long_about = "Listens for a key press, processes clipboard content (image OCR or audio transcription), pastes text, and restores original clipboard."
-)]
+#[command(/* ... */)]
 struct Args {
     #[arg(short, long, value_enum, help = "Key to trigger processing.")]
     trigger_key: PTTKey,
-
     #[arg(
         short = 'l',
         long,
         default_value = "eng",
-        help = "Tesseract language code(s) (e.g., 'eng', 'eng+fra') for OCR. Passed via '-l'."
+        help = "Tesseract language code(s)."
     )]
     lang: String,
-
-    #[arg(
-        long,
-        default_value = "tesseract",
-        help = "Path to the Tesseract executable or command name (if in PATH)."
-    )]
+    #[arg(long, default_value = "tesseract", help = "Tesseract command/path.")]
     tesseract_cmd: String,
-
-    #[arg(
-        long,
-        help = "Path to the Tesseract data directory (TESSDATA_PREFIX). Passed via '--tessdata-dir'."
-    )]
+    #[arg(long, help = "Path to Tesseract data directory.")]
     tessdata_path: Option<String>,
-
-    #[arg(
-        long,
-        help = "Additional arguments to pass directly to the Tesseract CLI.",
-        num_args = 0..
-    )]
+    #[arg(long, help = "Additional Tesseract CLI args.", num_args = 0..)]
     tesseract_args: Vec<String>,
-
-    // --- OpenAI API Key (CLI arg is optional, .env is checked first) ---
-    #[arg(
-        long,
-        help = "OpenAI API Key (overrides .env or OPENAI_API_KEY env var)."
-    )]
+    #[arg(long, help = "OpenAI API Key (overrides .env/env var).")]
     openai_api_key: Option<String>,
 }
 
@@ -84,47 +70,55 @@ enum ClipboardContent {
 }
 
 fn get_clipboard_content() -> Result<ClipboardContent> {
-    match get_clipboard::<Vec<String>, _>(formats::FileList) {
-        Ok(files) => {
-            println!("Clipboard contains FileList: {:?}", files);
-            return Ok(ClipboardContent::FileList(files));
-        }
-        Err(e) => {
-            if e.raw_code() != CLIPBRD_E_UNSUPPORTEDFORMAT {
-                println!(
-                    "Warning: Failed to get FileList for unexpected reason (Error {}): {}. Trying Bitmap.",
-                    e.raw_code(), e
-                );
-            } else {
-                println!("Clipboard does not contain FileList format. Trying Bitmap.");
+    // Use try_clipboard_content internally to ensure clipboard is closed after reading
+    fn try_get_clipboard_content() -> Result<ClipboardContent, clipboard_win::ErrorCode> {
+        // Open clipboard for reading
+        let _clip = Clipboard::new_attempts(10)?;
+
+        // Try FileList first
+        match get_clipboard::<Vec<String>, _>(formats::FileList) {
+            Ok(files) => return Ok(ClipboardContent::FileList(files)),
+            Err(e) => {
+                if e.raw_code() != CLIPBRD_E_UNSUPPORTEDFORMAT {
+                    println!("Warning: Failed to get FileList: {}. Trying Bitmap.", e);
+                } else {
+                    println!("Clipboard does not contain FileList format. Trying Bitmap.");
+                }
             }
         }
+
+        // Try Bitmap next
+        match get_clipboard::<Vec<u8>, _>(formats::Bitmap) {
+            Ok(bitmap_data) => return Ok(ClipboardContent::Bitmap(bitmap_data)),
+            Err(e) => {
+                if e.raw_code() != CLIPBRD_E_UNSUPPORTEDFORMAT {
+                    println!("Warning: Failed to get Bitmap: {}", e);
+                } else {
+                    println!("Clipboard does not contain Bitmap format either.");
+                }
+                // Return the specific error from clipboard-win
+                return Err(e);
+            }
+        }
+        // _clip guard drops here, closing clipboard
     }
 
-    match get_clipboard::<Vec<u8>, _>(formats::Bitmap) {
-        Ok(bitmap_data) => {
-            println!(
-                "Clipboard contains Bitmap data ({} bytes).",
-                bitmap_data.len()
-            );
-            return Ok(ClipboardContent::Bitmap(bitmap_data));
-        }
-        Err(e) => {
-            if e.raw_code() != CLIPBRD_E_UNSUPPORTEDFORMAT {
-                println!(
-                    "Warning: Failed to get Bitmap for unexpected reason (Error {}): {}",
-                    e.raw_code(),
-                    e
-                );
-            } else {
-                println!("Clipboard does not contain Bitmap format either.");
-            }
-            return Err(anyhow!("Failed to get Bitmap from clipboard: {}", e));
-        }
-    }
+    // Map the specific error to anyhow::Error
+    try_get_clipboard_content().map_err(|e| {
+        anyhow!(
+            "Failed to get supported content (FileList/Bitmap) from clipboard: {}",
+            e
+        )
+    })
 }
 
+// --- Helper to restore clipboard content ---
+// Ensure clipboard is opened before writing
 fn restore_clipboard(content: ClipboardContent) -> Result<()> {
+    // Acquire clipboard lock before writing
+    let _clip = Clipboard::new_attempts(10)
+        .map_err(|e| anyhow!("Failed to open clipboard for restoration: {}", e))?;
+
     match content {
         ClipboardContent::Bitmap(data) => {
             println!("Restoring Bitmap to clipboard...");
@@ -139,13 +133,18 @@ fn restore_clipboard(content: ClipboardContent) -> Result<()> {
                 .map_err(|e| anyhow!("Failed to restore FileList to clipboard: {}", e))
         }
     }
+    // _clip guard drops here, closing clipboard
 }
 
+// --- Core Processing Logic (Handles OCR, Audio, Video) ---
 fn process_clipboard_and_paste(
-    original_content: ClipboardContent, // Takes ownership
-    args: &Args,                        // Now contains key from arg OR env
+    original_content: ClipboardContent,
+    args: &Args,
     rt: &Runtime,
 ) -> Result<()> {
+    let mut _temp_audio_file_guard = None;
+    let mut _temp_image_file_guard = None;
+
     let processed_text_result = match &original_content {
         ClipboardContent::FileList(files) => {
             if files.len() == 1 {
@@ -156,62 +155,97 @@ fn process_clipboard_and_paste(
                     .map(|ext| ext.to_lowercase())
                     .unwrap_or_default();
 
+                let audio_path_to_transcribe: PathBuf;
+
                 if AUDIO_EXTENSIONS.contains(&extension.as_str()) {
                     println!("Detected single audio file: {:?}", file_path);
-                    // API key should be present in args.openai_api_key if found via arg or .env/env var
-                    let api_key = args.openai_api_key.as_ref().ok_or_else(|| {
-                        // This error should ideally not happen if logic in main is correct,
-                        // but keep it as a safeguard.
-                        anyhow!("OpenAI API Key is missing (checked arg, .env, env var).")
-                    })?;
-                    println!("INFO: Audio transcription requires ffmpeg to be installed and in your PATH.");
+                    audio_path_to_transcribe = file_path.clone();
+                } else if VIDEO_EXTENSIONS.contains(&extension.as_str()) {
+                    println!(
+                        "Detected single video file: {:?}. Extracting audio...",
+                        file_path
+                    );
+                    println!("INFO: Video processing requires ffmpeg in PATH.");
 
-                    let config = OpenAIConfig::new().with_api_key(api_key);
-                    let client = Client::with_config(config);
+                    let temp_audio_file = TempFileBuilder::new()
+                        .prefix("extracted_audio_")
+                        .suffix(".mp3")
+                        .tempfile_in(std::env::temp_dir())
+                        .with_context(|| "Failed to create temporary file for extracted audio")?;
 
-                    rt.block_on(transcribe::trans::transcribe(&client, &file_path))
+                    let temp_audio_path_obj = temp_audio_file.path().to_path_buf();
+                    _temp_audio_file_guard = Some(temp_audio_file);
+
+                    println!(
+                        "Extracting audio via ffmpeg to temporary file: {:?}",
+                        temp_audio_path_obj
+                    );
+                    // --- Added -y flag to ffmpeg command ---
+                    let ffmpeg_output = Command::new("ffmpeg")
+                        .arg("-i")
+                        .arg(&file_path)
+                        .arg("-vn")
+                        .arg("-q:a")
+                        .arg("0")
+                        .arg("-y") // <-- Add this flag to overwrite output
+                        .arg(&temp_audio_path_obj)
+                        .output()
                         .with_context(|| {
-                            format!("Audio transcription failed for file: {:?}", file_path)
-                        })
+                            "Failed to execute ffmpeg command. Is ffmpeg installed and in PATH?"
+                        })?;
+
+                    if !ffmpeg_output.status.success() {
+                        let stderr = String::from_utf8_lossy(&ffmpeg_output.stderr);
+                        return Err(anyhow!(
+                            "ffmpeg failed to extract audio (Status: {}):\n{}",
+                            ffmpeg_output.status,
+                            stderr
+                        ));
+                    }
+
+                    println!("Audio extraction successful.");
+                    audio_path_to_transcribe = temp_audio_path_obj;
                 } else {
-                    Err(anyhow!(
-                         "Clipboard contains a single file, but it's not a supported audio format (Checked: {:?}, Ext: {}).",
-                         AUDIO_EXTENSIONS, extension
-                     ))
+                    return Err(anyhow!(
+                        "Clipboard contains a single file, but it's not a supported audio or video format (Checked extensions: {:?}, {:?}, Found: {}).",
+                        AUDIO_EXTENSIONS, VIDEO_EXTENSIONS, extension
+                    ));
                 }
+
+                // --- Perform Transcription ---
+                let api_key = args.openai_api_key.as_ref().ok_or_else(|| {
+                    anyhow!("OpenAI API Key is missing (checked arg, .env, env var).")
+                })?;
+                let config = OpenAIConfig::new().with_api_key(api_key);
+                let client = Client::with_config(config);
+
+                rt.block_on(transcribe::trans::transcribe(
+                    &client,
+                    &audio_path_to_transcribe,
+                ))
+                .with_context(|| {
+                    format!(
+                        "Audio transcription failed for: {:?}",
+                        audio_path_to_transcribe
+                    )
+                })
             } else {
                 Err(anyhow!(
-                     "Clipboard contains {} files. Only single audio file transcription is supported.",
-                     files.len()
-                 ))
+                    "Clipboard contains {} files. Only single audio/video file processing is supported.",
+                    files.len()
+                ))
             }
         }
         ClipboardContent::Bitmap(bitmap_data) => {
             println!("Processing clipboard image with Tesseract OCR...");
-            let temp_dir = std::env::temp_dir();
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis();
-            let temp_image_filename =
-                format!("clipboard_ocr_{}_{}.png", std::process::id(), timestamp);
-            let temp_image_path = temp_dir.join(&temp_image_filename);
+            let temp_image_file = TempFileBuilder::new()
+                .prefix("clipboard_ocr_")
+                .suffix(".png")
+                .tempfile_in(std::env::temp_dir())
+                .with_context(|| "Failed to create temporary file for OCR image")?;
 
-            struct TempFileGuard<'a>(&'a Path);
-            impl Drop for TempFileGuard<'_> {
-                fn drop(&mut self) {
-                    if self.0.exists() {
-                        if let Err(e) = fs::remove_file(self.0) {
-                            eprintln!(
-                                "Warning: Failed to delete temporary image file {:?}: {}",
-                                self.0, e
-                            );
-                        } else {
-                            println!("Temporary image file {:?} deleted.", self.0);
-                        }
-                    }
-                }
-            }
-            let _temp_file_guard = TempFileGuard(&temp_image_path);
+            let temp_image_path = temp_image_file.path().to_path_buf();
+            _temp_image_file_guard = Some(temp_image_file);
 
             let img = image::load_from_memory(bitmap_data)
                 .with_context(|| "Failed to decode clipboard image data")?;
@@ -261,6 +295,7 @@ fn process_clipboard_and_paste(
         }
     };
 
+    // --- Handle result of processing ---
     match processed_text_result {
         Ok(processed_text) => {
             let trimmed_text = processed_text.trim();
@@ -276,10 +311,10 @@ fn process_clipboard_and_paste(
                 set_clipboard_string_helper(trimmed_text)
                     .with_context(|| "Failed to place processed text onto clipboard")?;
                 println!("Processed text placed on clipboard. Simulating paste (Ctrl+V)...");
-                thread::sleep(Duration::from_millis(150));
+                thread::sleep(Duration::from_millis(150)); // Delay between setting clipboard and pasting
                 send_ctrl_v().context("Failed to simulate Ctrl+V paste")?;
 
-                thread::sleep(Duration::from_millis(150));
+                thread::sleep(Duration::from_millis(150)); // Delay between pasting and restoring
                 restore_clipboard(original_content)
                     .with_context(|| "Failed to restore original content to clipboard")?;
                 println!("Original clipboard content restored.");
@@ -312,14 +347,10 @@ fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     Ok(())
 }
 
-// --- Main Function ---
 fn main() -> Result<()> {
-    // --- Load .env file BEFORE parsing args ---
-    // Ignore errors (e.g., if .env file is missing)
     match dotenvy::dotenv() {
         Ok(path) => println!("Loaded environment variables from: {:?}", path),
         Err(e) => {
-            // Don't fail if .env is missing, but maybe warn if it failed unexpectedly
             if !e.not_found() {
                 eprintln!("Warning: Failed to load .env file: {}", e);
             } else {
@@ -328,14 +359,10 @@ fn main() -> Result<()> {
         }
     };
 
-    // --- Parse Arguments ---
-    // Make args mutable so we can potentially update openai_api_key
     let mut args = Args::parse();
 
-    // --- Check/Load API Key (Priority: Argument > Environment Variable) ---
     if args.openai_api_key.is_none() {
-        println!("--openai-api-key argument not provided, checking OPENAI_API_KEY environment variable (loaded from system or .env)...");
-        // This will read the variable set by dotenvy OR the system environment
+        println!("--openai-api-key argument not provided, checking OPENAI_API_KEY environment variable...");
         match env::var("OPENAI_API_KEY") {
             Ok(key_from_env) => {
                 if !key_from_env.is_empty() {
@@ -352,12 +379,10 @@ fn main() -> Result<()> {
     } else {
         println!("Using OpenAI API Key provided via command-line argument.");
     }
-    // --- End API Key Check ---
 
     let rt = Runtime::new().context("Failed to create Tokio runtime")?;
     let target_key: rdev::Key = args.trigger_key.into();
 
-    // --- Startup Information ---
     println!("Clipboard Processor Started.");
     println!(
         "Trigger Key: {:?} (Converted to {:?})",
@@ -374,17 +399,15 @@ fn main() -> Result<()> {
     if !args.tesseract_args.is_empty() {
         println!("   Extra Tesseract Args: {:?}", args.tesseract_args);
     }
-    // Check the potentially updated args.openai_api_key
     if args.openai_api_key.is_some() {
-        println!(" > Audio Transcription: Enabled (Whisper API)");
+        println!(" > Audio/Video Transcription: Enabled (Whisper API via ffmpeg)");
         println!("   Requires: ffmpeg in PATH, valid API Key.");
     } else {
-        // Make message more informative
-        println!(" > Audio Transcription: Disabled (API Key not provided via arg or found in .env/environment)");
+        println!(" > Audio/Video Transcription: Disabled (API Key not provided via arg or found in .env/environment)");
     }
     println!("---");
     println!(
-        "Press '{:?}' when an image OR a single audio file is in the clipboard to process.",
+        "Press '{:?}' when an image OR a single audio/video file is in the clipboard to process.",
         args.trigger_key
     );
     println!(
@@ -393,7 +416,6 @@ fn main() -> Result<()> {
     println!("Ctrl+C in this window to exit.");
     println!("---");
 
-    // Clone args for the callback closure
     let args_clone = {
         Args {
             trigger_key: args.trigger_key,
@@ -401,7 +423,7 @@ fn main() -> Result<()> {
             tesseract_cmd: args.tesseract_cmd.clone(),
             tessdata_path: args.tessdata_path.clone(),
             tesseract_args: args.tesseract_args.clone(),
-            openai_api_key: args.openai_api_key.clone(), // Clone the potentially updated key
+            openai_api_key: args.openai_api_key.clone(),
         }
     };
 
@@ -411,7 +433,6 @@ fn main() -> Result<()> {
                 println!("\n--- Trigger key pressed! ---");
                 match get_clipboard_content() {
                     Ok(original_content) => {
-                        // Pass the cloned args which contain the resolved API key
                         if let Err(e) =
                             process_clipboard_and_paste(original_content, &args_clone, &rt)
                         {
@@ -439,7 +460,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+// --- Helper to set clipboard string ---
+// Ensure clipboard is opened before writing
 fn set_clipboard_string_helper(text: &str) -> Result<()> {
+    // Acquire clipboard lock before writing
+    let _clip = Clipboard::new_attempts(10)
+        .map_err(|e| anyhow!("Failed to open clipboard to set string: {}", e))?;
+
     clipboard_win::set_clipboard_string(text)
         .map_err(|e| anyhow!("Failed to set clipboard string: {}", e))
+    // _clip guard drops here, closing clipboard
 }
