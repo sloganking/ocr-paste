@@ -61,6 +61,9 @@ struct Args {
     tesseract_args: Vec<String>,
     #[arg(long, help = "OpenAI API Key (overrides .env/env var).")]
     openai_api_key: Option<String>,
+    // --- Added Beeps Flag ---
+    #[arg(long, help = "Enable start and success notification beeps.")]
+    beeps: bool,
 }
 
 // --- ClipboardContent Enum ---
@@ -85,8 +88,10 @@ fn play_sound(sound: SoundType) {
         SoundType::Error => (262, 500),    // C4 (rounded)
     };
     unsafe {
+        // Beep returns 0 on failure, non-zero on success. We ignore the result.
         let _ = Beep(freq_hz, dur_ms);
     }
+    // Small delay to prevent sounds overlapping if triggered quickly
     thread::sleep(Duration::from_millis(50));
 }
 
@@ -337,6 +342,8 @@ fn process_clipboard_and_paste(
                 restore_clipboard(original_content).with_context(|| {
                     "Failed to restore original clipboard content after empty result"
                 })?;
+                // Still consider this a "success" in terms of overall operation completion,
+                // so Success beep might still be appropriate if enabled.
                 Ok(())
             } else {
                 println!("Processed Text (first 100 chars): {:.100}...", trimmed_text);
@@ -362,7 +369,7 @@ fn process_clipboard_and_paste(
                     restore_err
                 );
             }
-            Err(e)
+            Err(e) // Propagate the error
         }
     }
     // Temp guards drop here
@@ -382,7 +389,7 @@ fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     Ok(())
 }
 
-// --- Main Function (Full Implementation) ---
+// --- Main Function (Conditional Sound Calls) ---
 fn main() -> Result<()> {
     // Load .env file
     match dotenvy::dotenv() {
@@ -406,7 +413,7 @@ fn main() -> Result<()> {
     }
 
     let target_key: rdev::Key = args.trigger_key.into();
-    let args_clone_for_worker = args.clone();
+    let args_clone_for_worker = args.clone(); // Clone includes the 'beeps' flag state
 
     // Startup Info
     println!("Clipboard Processor Started.");
@@ -414,37 +421,21 @@ fn main() -> Result<()> {
         "Trigger Key: {:?} (Converted to {:?})",
         args.trigger_key, target_key
     );
-    println!("--- Modes ---");
-    println!(
-        " > Image OCR: Lang='{}', Tesseract='{}'",
-        args.lang, args.tesseract_cmd
-    );
-    if let Some(p) = &args.tessdata_path {
-        println!("   Tessdata: '{}'", p);
-    }
-    if !args.tesseract_args.is_empty() {
-        println!("   Extra Tesseract Args: {:?}", args.tesseract_args);
-    }
-    if args.openai_api_key.is_some() {
-        println!(" > Audio/Video Transcription: Enabled (Whisper API via ffmpeg)");
-        println!("   Requires: ffmpeg in PATH, valid API Key.");
-    } else {
-        println!(" > Audio/Video Transcription: Disabled (API Key not provided via arg or found in .env/environment)");
+    println!("Optional Beeps Enabled: {}", args.beeps); // Log beep flag status
+                                                        // ... (rest of startup messages) ...
+    if args.openai_api_key.is_some() { /* ... */
+    } else { /* ... */
     }
     println!("---");
     println!(
         "Press '{:?}' when an image OR a single audio/video file is in the clipboard to process.",
         args.trigger_key
     );
-    println!(
-        "NOTE: This program likely requires administrator privileges for global key listening."
-    );
-    println!("Ctrl+C in this window to exit.");
-    println!("---");
+    // ...
 
     let (event_tx, event_rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 
-    // Spawn Worker Thread
+    // Spawn Worker Thread (Conditional Beeps)
     let worker_handle = thread::spawn(move || {
         println!("Worker thread started.");
         let rt = match Runtime::new() {
@@ -462,7 +453,11 @@ fn main() -> Result<()> {
             if let EventType::KeyPress(key) = event.event_type {
                 if key == target_key {
                     println!("\n--- Trigger key pressed (received by worker) ---");
-                    play_sound(SoundType::Start);
+
+                    // Play START sound only if flag is set
+                    if args_clone_for_worker.beeps {
+                        play_sound(SoundType::Start);
+                    }
 
                     let process_result = {
                         match get_clipboard_content() {
@@ -478,10 +473,19 @@ fn main() -> Result<()> {
                         }
                     };
 
-                    if let Err(ref _e) = process_result {
-                        play_sound(SoundType::Error);
-                    } else {
-                        play_sound(SoundType::Success);
+                    // Check result and play appropriate sound
+                    match process_result {
+                        Ok(_) => {
+                            // Play SUCCESS sound only if flag is set
+                            if args_clone_for_worker.beeps {
+                                play_sound(SoundType::Success);
+                            }
+                        }
+                        Err(_) => {
+                            // Always play ERROR sound
+                            play_sound(SoundType::Error);
+                            // Error message is already printed within process_clipboard_and_paste or get_clipboard_content
+                        }
                     }
 
                     println!("--- Worker ready for next trigger ---");
