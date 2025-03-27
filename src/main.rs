@@ -1,14 +1,11 @@
 // src/main.rs
 
-use anyhow::{anyhow, Context as AnyhowContext, Result}; // Keep AnyhowContext if used elsewhere, otherwise just Context
+use anyhow::{anyhow, Context as AnyhowContext, Result};
 use clap::Parser;
-use clipboard_win::{
-    formats,
-    get_clipboard,
-    Clipboard, // Keep for explicit open/close
-    Setter,
-};
+use clipboard_win::{formats, get_clipboard, Clipboard, Setter};
 use dotenvy;
+// Use winapi import
+use winapi::um::utilapiset::Beep;
 
 use image::ImageFormat;
 use rdev::{listen, simulate, Event, EventType, Key};
@@ -16,8 +13,8 @@ use std::{
     env,
     path::PathBuf,
     process::Command,
-    sync::mpsc::{self, Receiver, Sender}, // Keep channel imports
-    thread,                               // Keep thread import
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::Duration,
 };
 use tempfile::Builder as TempFileBuilder;
@@ -29,16 +26,16 @@ mod transcribe;
 use async_openai::{config::OpenAIConfig, Client};
 use tokio::runtime::Runtime;
 
+// --- Constants ---
 const AUDIO_EXTENSIONS: &[&str] = &[
     "wav", "mp3", "m4a", "ogg", "flac", "aac", "wma", "opus", "aiff", "aif",
 ];
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "mpeg", "mpg", "m4v", "3gp",
 ];
-
 const CLIPBRD_E_UNSUPPORTEDFORMAT: i32 = -2147221040;
 
-// --- Args struct remains the same (with Clone) ---
+// --- Args Struct ---
 #[derive(Parser, Debug, Clone)]
 #[command(
     author,
@@ -66,14 +63,34 @@ struct Args {
     openai_api_key: Option<String>,
 }
 
-// --- ClipboardContent enum remains the same ---
+// --- ClipboardContent Enum ---
 #[derive(Debug)]
 enum ClipboardContent {
     Bitmap(Vec<u8>),
     FileList(Vec<String>),
 }
 
-// --- Helper Functions (Restored with map_err for clipboard results) ---
+// --- Sound Type Enum ---
+enum SoundType {
+    Start,
+    Success,
+    Error,
+}
+
+// --- Helper: Play Sound (Windows Version) ---
+fn play_sound(sound: SoundType) {
+    let (freq_hz, dur_ms) = match sound {
+        SoundType::Start => (880, 150),    // A5
+        SoundType::Success => (1047, 300), // C6 (rounded)
+        SoundType::Error => (262, 500),    // C4 (rounded)
+    };
+    unsafe {
+        let _ = Beep(freq_hz, dur_ms);
+    }
+    thread::sleep(Duration::from_millis(50));
+}
+
+// --- Helper Functions (Full Implementations) ---
 fn get_clipboard_content() -> Result<ClipboardContent> {
     fn try_get_clipboard_content() -> Result<ClipboardContent, clipboard_win::ErrorCode> {
         let _clip = Clipboard::new_attempts(10)?; // Open clipboard
@@ -153,7 +170,7 @@ fn set_clipboard_string_helper(text: &str) -> Result<()> {
                                                                        // _clip drops here
 }
 
-// --- process_clipboard_and_paste (Restored Full Implementation) ---
+// --- process_clipboard_and_paste (Full Implementation) ---
 fn process_clipboard_and_paste(
     original_content: ClipboardContent,
     args: &Args,
@@ -165,7 +182,6 @@ fn process_clipboard_and_paste(
     let processed_text_result = match &original_content {
         ClipboardContent::FileList(files) => {
             if files.len() == 1 {
-                // file_path is declared here and used within this block
                 let file_path = PathBuf::from(&files[0]);
                 let extension = file_path
                     .extension()
@@ -189,7 +205,6 @@ fn process_clipboard_and_paste(
                         .prefix("extracted_audio_")
                         .suffix(".mp3")
                         .tempfile_in(std::env::temp_dir())
-                        // Use AnyhowContext here as tempfile returns std::io::Result
                         .with_context(|| "Failed to create temporary file for extracted audio")?;
 
                     let temp_audio_path_obj = temp_audio_file.path().to_path_buf();
@@ -208,7 +223,6 @@ fn process_clipboard_and_paste(
                         .arg("-y")
                         .arg(&temp_audio_path_obj)
                         .output()
-                        // Use AnyhowContext here as output() returns std::io::Result
                         .with_context(|| {
                             "Failed to execute ffmpeg command. Is ffmpeg installed and in PATH?"
                         })?;
@@ -242,7 +256,6 @@ fn process_clipboard_and_paste(
                     &client,
                     &audio_path_to_transcribe,
                 ))
-                // Use AnyhowContext as transcribe returns anyhow::Result
                 .with_context(|| {
                     format!(
                         "Audio transcription failed for: {:?}",
@@ -262,20 +275,17 @@ fn process_clipboard_and_paste(
                 .prefix("clipboard_ocr_")
                 .suffix(".png")
                 .tempfile_in(std::env::temp_dir())
-                // Use AnyhowContext here as tempfile returns std::io::Result
                 .with_context(|| "Failed to create temporary file for OCR image")?;
 
             let temp_image_path = temp_image_file.path().to_path_buf();
             _temp_image_file_guard = Some(temp_image_file);
 
-            // Use AnyhowContext as load_from_memory returns image::ImageResult
             let img = image::load_from_memory(bitmap_data)
                 .with_context(|| "Failed to decode clipboard image data")?;
             println!(
                 "Decoded image. Saving temporary PNG to {:?}",
                 temp_image_path
             );
-            // Use AnyhowContext as save_with_format returns image::ImageResult
             img.save_with_format(&temp_image_path, ImageFormat::Png)
                 .with_context(|| {
                     format!(
@@ -297,7 +307,6 @@ fn process_clipboard_and_paste(
                 command.arg(arg);
             }
 
-            // Use AnyhowContext as output() returns std::io::Result
             let output = command.output().with_context(|| {
                 format!(
                     "Failed to execute Tesseract command: '{}'",
@@ -313,7 +322,6 @@ fn process_clipboard_and_paste(
                     stderr
                 ))
             } else {
-                // Use AnyhowContext as from_utf8 returns std::result::Result
                 String::from_utf8(output.stdout)
                     .with_context(|| "Tesseract output was not valid UTF-8")
             }
@@ -326,7 +334,6 @@ fn process_clipboard_and_paste(
             let trimmed_text = processed_text.trim();
             if trimmed_text.is_empty() {
                 println!("Processing resulted in empty text. Skipping paste.");
-                // Use AnyhowContext as restore_clipboard now returns anyhow::Result
                 restore_clipboard(original_content).with_context(|| {
                     "Failed to restore original clipboard content after empty result"
                 })?;
@@ -334,16 +341,13 @@ fn process_clipboard_and_paste(
             } else {
                 println!("Processed Text (first 100 chars): {:.100}...", trimmed_text);
 
-                // Use AnyhowContext as helper returns anyhow::Result
                 set_clipboard_string_helper(trimmed_text)
                     .with_context(|| "Failed to place processed text onto clipboard")?;
                 println!("Processed text placed on clipboard. Simulating paste (Ctrl+V)...");
                 thread::sleep(Duration::from_millis(150));
-                // Use AnyhowContext as send_ctrl_v returns anyhow::Result if mapped, or specific error
-                send_ctrl_v().map_err(|e| anyhow!("Simulate Ctrl+V error: {}", e))?; // Map error if needed
+                send_ctrl_v().map_err(|e| anyhow!("Simulate Ctrl+V error: {}", e))?;
 
                 thread::sleep(Duration::from_millis(150));
-                // Use AnyhowContext as restore_clipboard returns anyhow::Result
                 restore_clipboard(original_content)
                     .with_context(|| "Failed to restore original content to clipboard")?;
                 println!("Original clipboard content restored.");
@@ -364,7 +368,7 @@ fn process_clipboard_and_paste(
     // Temp guards drop here
 }
 
-// --- send_ctrl_v (No changes) ---
+// --- send_ctrl_v (Full Implementation) ---
 fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     let delay = Duration::from_millis(30);
     simulate(&EventType::KeyPress(Key::ControlLeft))?;
@@ -378,10 +382,9 @@ fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     Ok(())
 }
 
-// --- Main Function (Restored dotenv match, fixed imports) ---
+// --- Main Function (Full Implementation) ---
 fn main() -> Result<()> {
     // Load .env file
-    // Corrected match statement
     match dotenvy::dotenv() {
         Ok(path) => println!("Loaded environment variables from: {:?}", path),
         Err(e) => {
@@ -411,7 +414,17 @@ fn main() -> Result<()> {
         "Trigger Key: {:?} (Converted to {:?})",
         args.trigger_key, target_key
     );
-    // ... (rest of startup messages) ...
+    println!("--- Modes ---");
+    println!(
+        " > Image OCR: Lang='{}', Tesseract='{}'",
+        args.lang, args.tesseract_cmd
+    );
+    if let Some(p) = &args.tessdata_path {
+        println!("   Tessdata: '{}'", p);
+    }
+    if !args.tesseract_args.is_empty() {
+        println!("   Extra Tesseract Args: {:?}", args.tesseract_args);
+    }
     if args.openai_api_key.is_some() {
         println!(" > Audio/Video Transcription: Enabled (Whisper API via ffmpeg)");
         println!("   Requires: ffmpeg in PATH, valid API Key.");
@@ -423,14 +436,17 @@ fn main() -> Result<()> {
         "Press '{:?}' when an image OR a single audio/video file is in the clipboard to process.",
         args.trigger_key
     );
-    // ...
+    println!(
+        "NOTE: This program likely requires administrator privileges for global key listening."
+    );
+    println!("Ctrl+C in this window to exit.");
+    println!("---");
 
     let (event_tx, event_rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 
     // Spawn Worker Thread
     let worker_handle = thread::spawn(move || {
         println!("Worker thread started.");
-        // Create Tokio runtime inside the worker thread
         let rt = match Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
@@ -446,20 +462,28 @@ fn main() -> Result<()> {
             if let EventType::KeyPress(key) = event.event_type {
                 if key == target_key {
                     println!("\n--- Trigger key pressed (received by worker) ---");
-                    match get_clipboard_content() {
-                        Ok(original_content) => {
-                            if let Err(e) = process_clipboard_and_paste(
+                    play_sound(SoundType::Start);
+
+                    let process_result = {
+                        match get_clipboard_content() {
+                            Ok(original_content) => process_clipboard_and_paste(
                                 original_content,
                                 &args_clone_for_worker,
                                 &rt,
-                            ) {
-                                eprintln!("ERROR during clipboard processing/restoration: {:?}", e);
+                            ),
+                            Err(e) => {
+                                eprintln!("ERROR getting clipboard content: {:?}", e);
+                                Err(e)
                             }
                         }
-                        Err(e) => {
-                            eprintln!("ERROR getting clipboard content: {:?}", e);
-                        }
+                    };
+
+                    if let Err(ref _e) = process_result {
+                        play_sound(SoundType::Error);
+                    } else {
+                        play_sound(SoundType::Success);
                     }
+
                     println!("--- Worker ready for next trigger ---");
                 }
             }
@@ -482,8 +506,8 @@ fn main() -> Result<()> {
         return Err(anyhow!("Keyboard listener setup failed: {:?}", error));
     }
 
-    // Optional: Join worker handle if listen could ever finish (unlikely)
-    // worker_handle.join().expect("Worker thread panicked");
+    // Optional: Join worker handle
+    worker_handle.join().expect("Worker thread panicked");
 
     Ok(())
 }
