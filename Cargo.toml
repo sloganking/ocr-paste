@@ -11,6 +11,9 @@ image = "0.25.6"
 lazy_static = "1.5.0"
 rdev = "0.5.3"
 
+rodio = "0.17"
+default-device-sink = "0.1"
+
 async-openai = "0.28.0" # Check for latest version
 tokio = { version = "1", features = [
     "full",
