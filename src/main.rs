@@ -24,6 +24,10 @@ use easy_rdev_key::PTTKey;
 mod transcribe;
 
 use async_openai::{config::OpenAIConfig, Client};
+use default_device_sink::DefaultDeviceSink;
+use rodio::source::{SineWave, Source};
+use rodio::Decoder;
+use std::io::{BufReader, Cursor};
 use tokio::runtime::Runtime;
 
 // --- Constants ---
@@ -93,6 +97,49 @@ fn play_sound(sound: SoundType) {
     }
     // Small delay to prevent sounds overlapping if triggered quickly
     thread::sleep(Duration::from_millis(50));
+}
+
+// --- Audio Helpers ---
+static TICK_BYTES: &[u8] = include_bytes!("../assets/tick.mp3");
+static FAILED_BYTES: &[u8] = include_bytes!("../assets/failed.mp3");
+
+fn tick_loop(stop_rx: mpsc::Receiver<()>) {
+    let tick_sink = DefaultDeviceSink::new();
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            tick_sink.stop();
+            break;
+        }
+        if tick_sink.empty() {
+            let cursor = Cursor::new(TICK_BYTES);
+            if let Ok(decoder) = Decoder::new(BufReader::new(cursor)) {
+                tick_sink.stop();
+                tick_sink.append(decoder);
+            } else {
+                tick_sink.stop();
+                tick_sink.append(
+                    SineWave::new(880.0)
+                        .take_duration(Duration::from_millis(50))
+                        .amplify(0.20),
+                );
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn play_failure_sound() {
+    let sink = DefaultDeviceSink::new();
+    if let Ok(decoder) = Decoder::new(BufReader::new(Cursor::new(FAILED_BYTES))) {
+        sink.append(decoder);
+    } else {
+        sink.append(
+            SineWave::new(440.0)
+                .take_duration(Duration::from_millis(150))
+                .amplify(0.20),
+        );
+    }
+    sink.sleep_until_end();
 }
 
 // --- Helper Functions (Full Implementations) ---
@@ -257,16 +304,28 @@ fn process_clipboard_and_paste(
                 let config = OpenAIConfig::new().with_api_key(api_key);
                 let client = Client::with_config(config);
 
-                rt.block_on(transcribe::trans::transcribe(
+                let (tick_tx, tick_rx) = mpsc::channel();
+                let tick_handle = thread::spawn(move || tick_loop(tick_rx));
+
+                let transcription_result = rt.block_on(transcribe::trans::transcribe(
                     &client,
                     &audio_path_to_transcribe,
-                ))
-                .with_context(|| {
-                    format!(
-                        "Audio transcription failed for: {:?}",
-                        audio_path_to_transcribe
-                    )
-                })
+                ));
+
+                let _ = tick_tx.send(());
+                let _ = tick_handle.join();
+
+                transcription_result
+                    .with_context(|| {
+                        format!(
+                            "Audio transcription failed for: {:?}",
+                            audio_path_to_transcribe
+                        )
+                    })
+                    .map_err(|e| {
+                        play_failure_sound();
+                        e
+                    })
             } else {
                 Err(anyhow!(
                     "Clipboard contains {} files. Only single audio/video file processing is supported.",
