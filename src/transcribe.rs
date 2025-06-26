@@ -35,8 +35,8 @@ pub mod trans {
             input, output_mp3_path
         );
 
-        // `ffmpeg -i input.ext -vn -ar 44100 -ac 2 -b:a 192k -f mp3 output.mp3`
-        // Added common parameters for better compatibility
+        // `ffmpeg -i input.ext -vn -ar 16000 -ac 1 -b:a 64k -f mp3 output.mp3`
+        // Use lower bitrate and sample rate for smaller files while keeping speech intelligible
         let ffmpeg_output = Command::new("ffmpeg")
             .args([
                 "-i",
@@ -45,11 +45,11 @@ pub mod trans {
                     .context("Input path contains invalid UTF-8")?,
                 "-vn", // No video
                 "-ar",
-                "44100", // Audio sample rate
+                "16000", // Audio sample rate (16kHz)
                 "-ac",
-                "2", // Audio channels
+                "1", // Mono audio
                 "-b:a",
-                "192k", // Audio bitrate
+                "64k", // Audio bitrate
                 "-f",
                 "mp3", // Force format to MP3
                 output_mp3_path
