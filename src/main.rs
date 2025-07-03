@@ -371,11 +371,19 @@ fn process_clipboard_and_paste(
                 command.arg(arg);
             }
 
-            let output = command.output().with_context(|| {
-                format!(
-                    "Failed to execute Tesseract command: '{}'",
-                    args.tesseract_cmd
-                )
+            let output = command.output().map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!(
+                        "Tesseract command '{}' not found. Please install Tesseract and ensure it is in your PATH.",
+                        args.tesseract_cmd
+                    )
+                } else {
+                    anyhow!(
+                        "Failed to execute Tesseract command '{}': {}",
+                        args.tesseract_cmd,
+                        err
+                    )
+                }
             })?;
 
             if !output.status.success() {
