@@ -548,10 +548,11 @@ fn main() -> Result<()> {
                                 play_sound(SoundType::Success);
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
                             // Always play ERROR sound
                             play_sound(SoundType::Error);
-                            // Error message is already printed within process_clipboard_and_paste or get_clipboard_content
+                            // Print error for visibility
+                            eprintln!("{}", e);
                         }
                     }
 
