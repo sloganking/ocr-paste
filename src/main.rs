@@ -7,8 +7,8 @@ use dotenvy;
 // Use winapi import
 use winapi::um::utilapiset::Beep;
 
-use image::ImageFormat;
 use bardecoder;
+use image::ImageFormat;
 use rdev::{listen, simulate, Event, EventType, Key};
 use std::{
     env,
@@ -335,7 +335,7 @@ fn process_clipboard_and_paste(
             }
         }
         ClipboardContent::Bitmap(bitmap_data) => {
-            println!("Processing clipboard image with Tesseract OCR...");
+            println!("Processing clipboard image...");
             let temp_image_file = TempFileBuilder::new()
                 .prefix("clipboard_ocr_")
                 .suffix(".png")
@@ -360,51 +360,74 @@ fn process_clipboard_and_paste(
                 })?;
             println!("Temporary image saved.");
 
-            println!("Running Tesseract CLI...");
-            let mut command = Command::new(&args.tesseract_cmd);
-            command.arg(&temp_image_path);
-            command.arg("stdout");
-            command.arg("-l").arg(&args.lang);
-            if let Some(tessdata) = &args.tessdata_path {
-                command.arg("--tessdata-dir").arg(tessdata);
-            }
-            for arg in &args.tesseract_args {
-                command.arg(arg);
-            }
+            // First, try to detect and decode QR codes
+            println!("Checking for QR codes...");
+            let decoder = bardecoder::default_decoder();
+            let qr_results: Vec<_> = decoder.decode(&img).into_iter().collect();
 
-            let output = command.output().map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    anyhow!(
-                        "Tesseract command '{}' not found. Please install Tesseract and ensure it is in your PATH.",
-                        args.tesseract_cmd
-                    )
-                } else {
-                    anyhow!(
-                        "Failed to execute Tesseract command '{}': {}",
-                        args.tesseract_cmd,
-                        err
-                    )
-                }
-            })?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(anyhow!(
-                    "Tesseract CLI failed (Status: {}):\n{}",
-                    output.status,
-                    stderr
-                ))
-            } else {
-                let text = String::from_utf8(output.stdout)
-                    .with_context(|| "Tesseract output was not valid UTF-8")?;
-                if text.trim().is_empty() {
-                    let decoder = bardecoder::default_decoder();
-                    if let Some(Ok(qr_text)) = decoder.decode(&img).into_iter().next() {
-                        Ok(qr_text)
-                    } else {
-                        Ok(text)
+            let qr_text = if !qr_results.is_empty() {
+                // Found QR codes, use the first successful result
+                let mut qr_text = None;
+                for result in qr_results {
+                    match result {
+                        Ok(text) => {
+                            println!("QR code detected and decoded successfully!");
+                            qr_text = Some(text);
+                            break;
+                        }
+                        Err(e) => {
+                            println!("QR code detected but failed to decode: {:?}", e);
+                        }
                     }
+                }
+                qr_text
+            } else {
+                println!("No QR codes detected, proceeding with OCR...");
+                None
+            };
+
+            // If we found a QR code, return it; otherwise try OCR
+            if let Some(text) = qr_text {
+                Ok(text)
+            } else {
+                // No QR codes found or all failed to decode, try OCR
+                println!("Running Tesseract CLI...");
+                let mut command = Command::new(&args.tesseract_cmd);
+                command.arg(&temp_image_path);
+                command.arg("stdout");
+                command.arg("-l").arg(&args.lang);
+                if let Some(tessdata) = &args.tessdata_path {
+                    command.arg("--tessdata-dir").arg(tessdata);
+                }
+                for arg in &args.tesseract_args {
+                    command.arg(arg);
+                }
+
+                let output = command.output().map_err(|err| {
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        anyhow!(
+                            "Tesseract command '{}' not found. Please install Tesseract and ensure it is in your PATH.",
+                            args.tesseract_cmd
+                        )
+                    } else {
+                        anyhow!(
+                            "Failed to execute Tesseract command '{}': {}",
+                            args.tesseract_cmd,
+                            err
+                        )
+                    }
+                })?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    Err(anyhow!(
+                        "Tesseract CLI failed (Status: {}):\n{}",
+                        output.status,
+                        stderr
+                    ))
                 } else {
+                    let text = String::from_utf8(output.stdout)
+                        .with_context(|| "Tesseract output was not valid UTF-8")?;
                     Ok(text)
                 }
             }
