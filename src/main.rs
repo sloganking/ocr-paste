@@ -9,7 +9,7 @@ use winapi::um::utilapiset::Beep;
 
 use bardecoder;
 use image::ImageFormat;
-use rdev::{listen, simulate, Event, EventType, Key};
+use rdev::{listen, simulate, Button, Event, EventType, Key};
 use std::{
     env,
     path::PathBuf,
@@ -26,9 +26,12 @@ mod transcribe;
 
 use async_openai::{config::OpenAIConfig, Client};
 use default_device_sink::DefaultDeviceSink;
+use eframe::egui;
 use rodio::source::{SineWave, Source};
 use rodio::Decoder;
 use std::io::{BufReader, Cursor};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tray_item::TrayItem;
 
@@ -491,6 +494,77 @@ fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     Ok(())
 }
 
+// --- Trigger type and Settings GUI ---
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Trigger {
+    Key(Key),
+    Mouse(Button),
+}
+
+fn format_trigger(trigger: &Trigger) -> String {
+    match trigger {
+        Trigger::Key(k) => format!("Key: {:?}", k),
+        Trigger::Mouse(b) => format!("Mouse: {:?}", b),
+    }
+}
+
+struct SettingsApp {
+    shared_trigger: Arc<Mutex<Trigger>>,
+    is_recording: bool,
+    last_set: Option<Trigger>,
+    record_request: Arc<AtomicBool>,
+}
+
+impl SettingsApp {
+    fn new(shared_trigger: Arc<Mutex<Trigger>>, record_request: Arc<AtomicBool>) -> Self {
+        Self {
+            shared_trigger,
+            is_recording: false,
+            last_set: None,
+            record_request,
+        }
+    }
+}
+
+impl eframe::App for SettingsApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Recording handled by worker via global hook; GUI only toggles record flag
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("OCR Paste Settings");
+            ui.add_space(8.0);
+
+            // Current trigger display
+            let current = {
+                let guard = self.shared_trigger.lock().unwrap();
+                format_trigger(&*guard)
+            };
+            ui.label(format!("Current trigger: {}", current));
+
+            if let Some(tr) = self.last_set {
+                ui.label(format!("Last set: {}", format_trigger(&tr)));
+            }
+
+            ui.add_space(10.0);
+            if !self.is_recording {
+                if ui.button("Set trigger...").clicked() {
+                    self.is_recording = true;
+                    self.record_request.store(true, Ordering::SeqCst);
+                }
+            } else {
+                ui.colored_label(egui::Color32::YELLOW, "Press any key or mouse button...");
+                if ui.button("Cancel").clicked() {
+                    self.is_recording = false;
+                    self.record_request.store(false, Ordering::SeqCst);
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.label("Close this window after setting the trigger.");
+        });
+    }
+}
+
 // --- Main Function (Conditional Sound Calls) ---
 fn main() -> Result<()> {
     // Load .env file
@@ -515,6 +589,12 @@ fn main() -> Result<()> {
     }
 
     let target_key: rdev::Key = args.trigger_key.into();
+    let current_trigger = Arc::new(Mutex::new(Trigger::Key(target_key)));
+    let current_trigger_for_worker = Arc::clone(&current_trigger);
+    let current_trigger_for_gui = Arc::clone(&current_trigger);
+    let record_request = Arc::new(AtomicBool::new(false));
+    let record_request_for_worker = Arc::clone(&record_request);
+    let record_request_for_gui = Arc::clone(&record_request);
     let args_clone_for_worker = args.clone(); // Clone includes the 'beeps' flag state
 
     // Startup Info
@@ -540,6 +620,29 @@ fn main() -> Result<()> {
     {
         match TrayItem::new("OCR Paste", tray_item::IconSource::Resource("IDI_ICON1")) {
             Ok(mut tray) => {
+                // Settings menu
+                let trigger_for_menu = Arc::clone(&current_trigger_for_gui);
+                let _ = tray.add_menu_item("Settings", move || {
+                    let trigger_for_gui = Arc::clone(&trigger_for_menu);
+                    let record_for_gui = Arc::clone(&record_request_for_gui);
+                    std::thread::spawn(move || {
+                        let mut native_options = eframe::NativeOptions::default();
+                        native_options.event_loop_builder = Some(Box::new(|builder| {
+                            #[cfg(target_os = "windows")]
+                            {
+                                use winit::platform::windows::EventLoopBuilderExtWindows;
+                                builder.with_any_thread(true);
+                            }
+                        }));
+                        let _ = eframe::run_native(
+                            "OCR Paste Settings",
+                            native_options,
+                            Box::new(move |_cc| {
+                                Box::new(SettingsApp::new(trigger_for_gui, record_for_gui))
+                            }),
+                        );
+                    });
+                });
                 let _ = tray.add_menu_item("Exit", move || {
                     // Immediate exit on menu click
                     std::process::exit(0);
@@ -570,47 +673,77 @@ fn main() -> Result<()> {
         };
 
         for event in event_rx {
-            if let EventType::KeyPress(key) = event.event_type {
-                if key == target_key {
-                    println!("\n--- Trigger key pressed (received by worker) ---");
-
-                    // Play START sound only if flag is set
-                    if args_clone_for_worker.beeps {
-                        play_sound(SoundType::Start);
+            if record_request_for_worker.load(Ordering::SeqCst) {
+                match event.event_type {
+                    EventType::KeyPress(k) => {
+                        if let Ok(mut guard) = current_trigger_for_worker.lock() {
+                            *guard = Trigger::Key(k);
+                        }
+                        record_request_for_worker.store(false, Ordering::SeqCst);
+                        continue;
                     }
-
-                    let process_result = {
-                        match get_clipboard_content() {
-                            Ok(original_content) => process_clipboard_and_paste(
-                                original_content,
-                                &args_clone_for_worker,
-                                &rt,
-                            ),
-                            Err(e) => {
-                                eprintln!("ERROR getting clipboard content: {:?}", e);
-                                Err(e)
-                            }
+                    EventType::ButtonPress(b) => {
+                        if let Ok(mut guard) = current_trigger_for_worker.lock() {
+                            *guard = Trigger::Mouse(b);
                         }
-                    };
-
-                    // Check result and play appropriate sound
-                    match process_result {
-                        Ok(_) => {
-                            // Play SUCCESS sound only if flag is set
-                            if args_clone_for_worker.beeps {
-                                play_sound(SoundType::Success);
-                            }
-                        }
-                        Err(e) => {
-                            // Always play ERROR sound
-                            play_sound(SoundType::Error);
-                            // Print error for visibility
-                            eprintln!("{}", e);
-                        }
+                        record_request_for_worker.store(false, Ordering::SeqCst);
+                        continue;
                     }
-
-                    println!("--- Worker ready for next trigger ---");
+                    _ => {}
                 }
+            }
+
+            let should_trigger = match event.event_type {
+                EventType::KeyPress(key) => {
+                    let guard = current_trigger_for_worker.lock().unwrap();
+                    matches!(*guard, Trigger::Key(k) if k == key)
+                }
+                EventType::ButtonPress(button) => {
+                    let guard = current_trigger_for_worker.lock().unwrap();
+                    matches!(*guard, Trigger::Mouse(b) if b == button)
+                }
+                _ => false,
+            };
+
+            if should_trigger {
+                println!("\n--- Trigger key pressed (received by worker) ---");
+
+                // Play START sound only if flag is set
+                if args_clone_for_worker.beeps {
+                    play_sound(SoundType::Start);
+                }
+
+                let process_result = {
+                    match get_clipboard_content() {
+                        Ok(original_content) => process_clipboard_and_paste(
+                            original_content,
+                            &args_clone_for_worker,
+                            &rt,
+                        ),
+                        Err(e) => {
+                            eprintln!("ERROR getting clipboard content: {:?}", e);
+                            Err(e)
+                        }
+                    }
+                };
+
+                // Check result and play appropriate sound
+                match process_result {
+                    Ok(_) => {
+                        // Play SUCCESS sound only if flag is set
+                        if args_clone_for_worker.beeps {
+                            play_sound(SoundType::Success);
+                        }
+                    }
+                    Err(e) => {
+                        // Always play ERROR sound
+                        play_sound(SoundType::Error);
+                        // Print error for visibility
+                        eprintln!("{}", e);
+                    }
+                }
+
+                println!("--- Worker ready for next trigger ---");
             }
         }
         println!("Worker thread finished.");
