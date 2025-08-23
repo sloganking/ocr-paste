@@ -30,6 +30,7 @@ use rodio::source::{SineWave, Source};
 use rodio::Decoder;
 use std::io::{BufReader, Cursor};
 use tokio::runtime::Runtime;
+use tray_item::TrayItem;
 
 // --- Constants ---
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -532,7 +533,25 @@ fn main() -> Result<()> {
         "Press '{:?}' when an image OR a single audio/video file is in the clipboard to process.",
         args.trigger_key
     );
-    // ...
+    // Create system tray with embedded icon resource (built via build.rs)
+    #[cfg(target_os = "windows")]
+    let mut _tray: Option<TrayItem> = None;
+    #[cfg(target_os = "windows")]
+    {
+        match TrayItem::new("OCR Paste", tray_item::IconSource::Resource("IDI_ICON1")) {
+            Ok(mut tray) => {
+                let _ = tray.add_menu_item("Exit", move || {
+                    // Immediate exit on menu click
+                    std::process::exit(0);
+                });
+                println!("System tray ready. Right-click for options (Exit).\n");
+                _tray = Some(tray); // keep alive for program lifetime
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to create system tray: {}", e);
+            }
+        }
+    }
 
     let (event_tx, event_rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 

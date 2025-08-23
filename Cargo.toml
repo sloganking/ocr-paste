@@ -25,3 +25,8 @@ dotenvy = "0.15.7"
 winapi = { version = "0.3.9", features = [
     "utilapiset",
 ] } # Ensure this line is present
+tray-item = "0.8.0"
+
+[build-dependencies]
+embed-resource = "2"
+ico = "0.3"
