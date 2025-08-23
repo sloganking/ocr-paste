@@ -8,6 +8,7 @@ use dotenvy;
 use winapi::um::utilapiset::Beep;
 
 use image::ImageFormat;
+use bardecoder;
 use rdev::{listen, simulate, Event, EventType, Key};
 use std::{
     env,
@@ -394,8 +395,18 @@ fn process_clipboard_and_paste(
                     stderr
                 ))
             } else {
-                String::from_utf8(output.stdout)
-                    .with_context(|| "Tesseract output was not valid UTF-8")
+                let text = String::from_utf8(output.stdout)
+                    .with_context(|| "Tesseract output was not valid UTF-8")?;
+                if text.trim().is_empty() {
+                    let decoder = bardecoder::default_decoder();
+                    if let Some(Ok(qr_text)) = decoder.decode(&img).into_iter().next() {
+                        Ok(qr_text)
+                    } else {
+                        Ok(text)
+                    }
+                } else {
+                    Ok(text)
+                }
             }
         }
     };

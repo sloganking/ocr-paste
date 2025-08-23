@@ -7,9 +7,11 @@ edition = "2021"
 anyhow = "1.0.97"
 clap = { version = "4.5.32", features = ["derive"] }
 clipboard-win = "5.4.0"
-image = "0.25.6"
+image = "0.24.9"
 lazy_static = "1.5.0"
 rdev = "0.5.3"
+
+bardecoder = "0.5"
 
 rodio = "0.17"
 default-device-sink = "0.1"
