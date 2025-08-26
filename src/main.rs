@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context as AnyhowContext, Result};
 use clap::Parser;
+use clap::ValueEnum;
 use clipboard_win::{formats, get_clipboard, Clipboard, Setter};
 use dotenvy;
 // Use winapi import
@@ -53,8 +54,14 @@ const CLIPBRD_E_UNSUPPORTEDFORMAT: i32 = -2147221040;
     long_about = "Listens for a key press, processes clipboard content (image OCR or audio transcription), pastes text, and restores original clipboard."
 )]
 struct Args {
-    #[arg(short, long, value_enum, help = "Key to trigger processing.")]
-    trigger_key: PTTKey,
+    #[arg(
+        short,
+        long,
+        value_enum,
+        help = "Key to trigger processing.",
+        required_unless_present = "settings"
+    )]
+    trigger_key: Option<PTTKey>,
     #[arg(
         short = 'l',
         long,
@@ -73,6 +80,8 @@ struct Args {
     // --- Added Beeps Flag ---
     #[arg(long, help = "Enable start and success notification beeps.")]
     beeps: bool,
+    #[arg(long, help = "Open standalone Settings window and exit.")]
+    settings: bool,
 }
 
 // --- ClipboardContent Enum ---
@@ -87,6 +96,11 @@ enum SoundType {
     Start,
     Success,
     Error,
+}
+
+// Control messages for the Settings window
+enum GuiMsg {
+    Show,
 }
 
 // Map egui key events to rdev keys for trigger recording inside the GUI
@@ -597,20 +611,92 @@ fn format_trigger(trigger: &Trigger) -> String {
     }
 }
 
+// --- Persistent trigger storage (for separate settings process) ---
+fn trigger_store_path() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let mut p = PathBuf::from(appdata);
+            p.push("ocrp");
+            let _ = std::fs::create_dir_all(&p);
+            p.push("trigger.txt");
+            return p;
+        }
+    }
+    let mut p = std::env::temp_dir();
+    p.push("ocrp_trigger.txt");
+    p
+}
+
+fn save_trigger_to_disk_key(ptt: PTTKey) {
+    let path = trigger_store_path();
+    let _ = std::fs::write(path, format!("key:{}", format!("{:?}", ptt)));
+}
+
+fn save_trigger_to_disk_mouse(button: Button) {
+    let path = trigger_store_path();
+    let label = match button {
+        Button::Left => "Left".to_string(),
+        Button::Right => "Right".to_string(),
+        Button::Middle => "Middle".to_string(),
+        Button::Unknown(code) => format!("Unknown({})", code),
+    };
+    let _ = std::fs::write(path, format!("mouse:{}", label));
+}
+
+fn load_trigger_from_disk() -> Option<Trigger> {
+    let path = trigger_store_path();
+    let data = std::fs::read_to_string(path).ok()?;
+    let mut parts = data.splitn(2, ':');
+    let kind = parts.next()?;
+    let val = parts.next()?.trim();
+    match kind {
+        "key" => match PTTKey::from_str(val, true) {
+            Ok(ptt) => {
+                let rkey: Key = ptt.into();
+                Some(Trigger::Key(rkey))
+            }
+            Err(_) => None,
+        },
+        "mouse" => {
+            let button = match val {
+                "Left" => Button::Left,
+                "Right" => Button::Right,
+                "Middle" => Button::Middle,
+                other if other.starts_with("Unknown(") && other.ends_with(")") => {
+                    let inner = &other[8..other.len() - 1];
+                    inner.parse::<u8>().map(Button::Unknown).ok()?
+                }
+                _ => return None,
+            };
+            Some(Trigger::Mouse(button))
+        }
+        _ => None,
+    }
+}
+
 struct SettingsApp {
     shared_trigger: Arc<Mutex<Trigger>>,
     is_recording: bool,
     last_set: Option<Trigger>,
     record_request: Arc<AtomicBool>,
+    gui_rx: mpsc::Receiver<GuiMsg>,
+    initialized: bool,
 }
 
 impl SettingsApp {
-    fn new(shared_trigger: Arc<Mutex<Trigger>>, record_request: Arc<AtomicBool>) -> Self {
+    fn new(
+        shared_trigger: Arc<Mutex<Trigger>>,
+        record_request: Arc<AtomicBool>,
+        gui_rx: mpsc::Receiver<GuiMsg>,
+    ) -> Self {
         Self {
             shared_trigger,
             is_recording: false,
             last_set: None,
             record_request,
+            gui_rx,
+            initialized: false,
         }
     }
 }
@@ -618,6 +704,32 @@ impl SettingsApp {
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Recording handled by worker via global hook; GUI only toggles record flag
+
+        // Ensure we keep ticking even when hidden so we can process Show messages
+        ctx.request_repaint_after(Duration::from_millis(200));
+
+        // Start visible initially; we only hide on close and show on demand
+
+        // Intercept OS close (X) → hide instead of quitting the event loop
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // Handle show requests from the tray
+        while let Ok(msg) = self.gui_rx.try_recv() {
+            match msg {
+                GuiMsg::Show => {
+                    // Ensure a sensible size and make visible/focused
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                        520.0, 260.0,
+                    )));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("OCR Paste Settings");
@@ -645,6 +757,7 @@ impl eframe::App for SettingsApp {
                 if ui.button("Cancel").clicked() {
                     self.is_recording = false;
                     self.record_request.store(false, Ordering::SeqCst);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
 
                 // Capture next egui input while recording and map to rdev trigger
@@ -664,6 +777,7 @@ impl eframe::App for SettingsApp {
                                         *guard = Trigger::Key(rkey);
                                         self.last_set = Some(*guard);
                                     }
+                                    save_trigger_to_disk_key(ptt);
                                     self.is_recording = false;
                                     self.record_request.store(false, Ordering::SeqCst);
                                     break;
@@ -686,6 +800,7 @@ impl eframe::App for SettingsApp {
                                     *guard = Trigger::Mouse(rbutton);
                                     self.last_set = Some(*guard);
                                 }
+                                save_trigger_to_disk_mouse(rbutton);
                                 self.is_recording = false;
                                 self.record_request.store(false, Ordering::SeqCst);
                                 break;
@@ -725,7 +840,36 @@ fn main() -> Result<()> {
         }
     }
 
-    let target_key: rdev::Key = args.trigger_key.into();
+    // If launched as settings-only, run the GUI and exit
+    if args.settings {
+        let default_key = easy_rdev_key::PTTKey::F13;
+        let trigger_for_gui = Arc::new(Mutex::new(Trigger::Key(default_key.into())));
+        let record_for_gui = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel::<GuiMsg>();
+        let mut native_options = eframe::NativeOptions::default();
+        native_options.event_loop_builder = Some(Box::new(|builder| {
+            #[cfg(target_os = "windows")]
+            {
+                use winit::platform::windows::EventLoopBuilderExtWindows;
+                builder.with_any_thread(true);
+            }
+        }));
+        let _ = eframe::run_native(
+            "OCR Paste Settings",
+            native_options,
+            Box::new(move |_cc| Box::new(SettingsApp::new(trigger_for_gui, record_for_gui, rx))),
+        );
+        return Ok(());
+    }
+
+    // Load persisted trigger if available; fall back to CLI/default F13
+    let target_key: rdev::Key = match load_trigger_from_disk() {
+        Some(Trigger::Key(k)) => k,
+        _ => args
+            .trigger_key
+            .unwrap_or(easy_rdev_key::PTTKey::F13)
+            .into(),
+    };
     let current_trigger = Arc::new(Mutex::new(Trigger::Key(target_key)));
     let current_trigger_for_worker = Arc::clone(&current_trigger);
     let current_trigger_for_gui = Arc::clone(&current_trigger);
@@ -736,10 +880,7 @@ fn main() -> Result<()> {
 
     // Startup Info
     println!("Clipboard Processor Started.");
-    println!(
-        "Trigger Key: {:?} (Converted to {:?})",
-        args.trigger_key, target_key
-    );
+    println!("Trigger Key: {:?}", target_key);
     println!("Optional Beeps Enabled: {}", args.beeps); // Log beep flag status
                                                         // ... (rest of startup messages) ...
     if args.openai_api_key.is_some() { /* ... */
@@ -748,7 +889,7 @@ fn main() -> Result<()> {
     println!("---");
     println!(
         "Press '{:?}' when an image OR a single audio/video file is in the clipboard to process.",
-        args.trigger_key
+        target_key
     );
     // Create system tray with embedded icon resource (built via build.rs)
     #[cfg(target_os = "windows")]
@@ -757,28 +898,11 @@ fn main() -> Result<()> {
     {
         match TrayItem::new("OCR Paste", tray_item::IconSource::Resource("IDI_ICON1")) {
             Ok(mut tray) => {
-                // Settings menu
-                let trigger_for_menu = Arc::clone(&current_trigger_for_gui);
-                let _ = tray.add_menu_item("Settings", move || {
-                    let trigger_for_gui = Arc::clone(&trigger_for_menu);
-                    let record_for_gui = Arc::clone(&record_request_for_gui);
-                    std::thread::spawn(move || {
-                        let mut native_options = eframe::NativeOptions::default();
-                        native_options.event_loop_builder = Some(Box::new(|builder| {
-                            #[cfg(target_os = "windows")]
-                            {
-                                use winit::platform::windows::EventLoopBuilderExtWindows;
-                                builder.with_any_thread(true);
-                            }
-                        }));
-                        let _ = eframe::run_native(
-                            "OCR Paste Settings",
-                            native_options,
-                            Box::new(move |_cc| {
-                                Box::new(SettingsApp::new(trigger_for_gui, record_for_gui))
-                            }),
-                        );
-                    });
+                // Tray-only control: record next input as trigger
+                let record_flag_for_menu = Arc::clone(&record_request_for_gui);
+                let _ = tray.add_menu_item("Set Trigger (next input)", move || {
+                    println!("Recording next key or mouse button as trigger...");
+                    record_flag_for_menu.store(true, Ordering::SeqCst);
                 });
                 let _ = tray.add_menu_item("Exit", move || {
                     // Immediate exit on menu click
@@ -810,8 +934,11 @@ fn main() -> Result<()> {
         };
 
         for event in event_rx {
-            // print the event unless it's MouseMove:
-            if !matches!(event.event_type, EventType::MouseMove { .. }) {
+            // print the event unless it's MouseMove or Wheel:
+            if !matches!(
+                event.event_type,
+                EventType::MouseMove { .. } | EventType::Wheel { .. }
+            ) {
                 println!("Event: {:?}", event);
             }
 
