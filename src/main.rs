@@ -9,7 +9,7 @@ use winapi::um::utilapiset::Beep;
 
 use bardecoder;
 use image::ImageFormat;
-use rdev::{listen, simulate, Event, EventType, Key};
+use rdev::{listen, simulate, Button, Event, EventType, Key};
 use std::{
     env,
     path::PathBuf,
@@ -29,7 +29,10 @@ use default_device_sink::DefaultDeviceSink;
 use rodio::source::{SineWave, Source};
 use rodio::Decoder;
 use std::io::{BufReader, Cursor};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
+use tray_item::TrayItem;
 
 // --- Constants ---
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -49,8 +52,14 @@ const CLIPBRD_E_UNSUPPORTEDFORMAT: i32 = -2147221040;
     long_about = "Listens for a key press, processes clipboard content (image OCR or audio transcription), pastes text, and restores original clipboard."
 )]
 struct Args {
-    #[arg(short, long, value_enum, help = "Key to trigger processing.")]
-    trigger_key: PTTKey,
+    #[arg(
+        short,
+        long,
+        value_enum,
+        help = "Key to trigger processing.",
+        required_unless_present = "settings"
+    )]
+    trigger_key: Option<PTTKey>,
     #[arg(
         short = 'l',
         long,
@@ -69,6 +78,8 @@ struct Args {
     // --- Added Beeps Flag ---
     #[arg(long, help = "Enable start and success notification beeps.")]
     beeps: bool,
+    #[arg(long, help = "Open standalone Settings window and exit.")]
+    settings: bool,
 }
 
 // --- ClipboardContent Enum ---
@@ -85,22 +96,7 @@ enum SoundType {
     Error,
 }
 
-// --- Helper: Play Sound (Windows Version) ---
-fn play_sound(sound: SoundType) {
-    let (freq_hz, dur_ms) = match sound {
-        SoundType::Start => (880, 150),    // A5
-        SoundType::Success => (1047, 300), // C6 (rounded)
-        SoundType::Error => (262, 500),    // C4 (rounded)
-    };
-    unsafe {
-        // Beep returns 0 on failure, non-zero on success. We ignore the result.
-        let _ = Beep(freq_hz, dur_ms);
-    }
-    // Small delay to prevent sounds overlapping if triggered quickly
-    thread::sleep(Duration::from_millis(50));
-}
-
-// --- Audio Helpers ---
+// --- Audio Helpers and functions (unchanged below)...
 static TICK_BYTES: &[u8] = include_bytes!("../assets/tick.mp3");
 static FAILED_BYTES: &[u8] = include_bytes!("../assets/failed.mp3");
 
@@ -141,6 +137,18 @@ fn play_failure_sound() {
         );
     }
     sink.sleep_until_end();
+}
+
+fn play_sound(sound: SoundType) {
+    let (freq_hz, dur_ms) = match sound {
+        SoundType::Start => (880, 150),
+        SoundType::Success => (1047, 300),
+        SoundType::Error => (262, 500),
+    };
+    unsafe {
+        let _ = Beep(freq_hz, dur_ms);
+    }
+    thread::sleep(Duration::from_millis(50));
 }
 
 // --- Helper Functions (Full Implementations) ---
@@ -490,7 +498,21 @@ fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     Ok(())
 }
 
-// --- Main Function (Conditional Sound Calls) ---
+// --- Trigger type (tray-only configuration) ---
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Trigger {
+    Key(Key),
+    Mouse(Button),
+}
+
+fn format_trigger(trigger: &Trigger) -> String {
+    match trigger {
+        Trigger::Key(k) => format!("Key: {:?}", k),
+        Trigger::Mouse(b) => format!("Mouse: {:?}", b),
+    }
+}
+
+// --- Main Function (Tray-only settings) ---
 fn main() -> Result<()> {
     // Load .env file
     match dotenvy::dotenv() {
@@ -513,32 +535,56 @@ fn main() -> Result<()> {
         }
     }
 
-    let target_key: rdev::Key = args.trigger_key.into();
-    let args_clone_for_worker = args.clone(); // Clone includes the 'beeps' flag state
+    // Ignore --settings now that GUI is removed; start normally
+    let target_key: rdev::Key = args.trigger_key.unwrap_or(PTTKey::F13).into();
+    let current_trigger = Arc::new(Mutex::new(Trigger::Key(target_key)));
+    let current_trigger_for_worker = Arc::clone(&current_trigger);
+    let record_request = Arc::new(AtomicBool::new(false));
+    let record_request_for_worker = Arc::clone(&record_request);
 
     // Startup Info
     println!("Clipboard Processor Started.");
-    println!(
-        "Trigger Key: {:?} (Converted to {:?})",
-        args.trigger_key, target_key
-    );
-    println!("Optional Beeps Enabled: {}", args.beeps); // Log beep flag status
-                                                        // ... (rest of startup messages) ...
+    println!("Trigger Key: {:?}", target_key);
+    println!("Optional Beeps Enabled: {}", args.beeps);
     if args.openai_api_key.is_some() { /* ... */
     } else { /* ... */
     }
     println!("---");
     println!(
         "Press '{:?}' when an image OR a single audio/video file is in the clipboard to process.",
-        args.trigger_key
+        target_key
     );
-    // ...
+
+    // Create system tray
+    #[cfg(target_os = "windows")]
+    let mut _tray: Option<TrayItem> = None;
+    #[cfg(target_os = "windows")]
+    {
+        match TrayItem::new("OCR Paste", tray_item::IconSource::Resource("IDI_ICON1")) {
+            Ok(mut tray) => {
+                // Tray-only control: record next input as trigger
+                let record_flag_for_menu = Arc::clone(&record_request);
+                let _ = tray.add_menu_item("Set Trigger (next input)", move || {
+                    println!("Recording next key or mouse button as trigger...");
+                    record_flag_for_menu.store(true, Ordering::SeqCst);
+                });
+                let _ = tray.add_menu_item("Exit", move || {
+                    std::process::exit(0);
+                });
+                println!("System tray ready. Right-click for options (Exit).\n");
+                _tray = Some(tray);
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to create system tray: {}", e);
+            }
+        }
+    }
 
     let (event_tx, event_rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 
-    // Spawn Worker Thread (Conditional Beeps)
+    // Spawn Worker Thread
+    let args_clone_for_worker = args.clone();
     let worker_handle = thread::spawn(move || {
-        println!("Worker thread started.");
         let rt = match Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
@@ -551,47 +597,83 @@ fn main() -> Result<()> {
         };
 
         for event in event_rx {
-            if let EventType::KeyPress(key) = event.event_type {
-                if key == target_key {
-                    println!("\n--- Trigger key pressed (received by worker) ---");
+            // print the event unless it's MouseMove or Wheel:
+            if !matches!(
+                event.event_type,
+                EventType::MouseMove { .. } | EventType::Wheel { .. }
+            ) {
+                println!("Event: {:?}", event);
+            }
 
-                    // Play START sound only if flag is set
-                    if args_clone_for_worker.beeps {
-                        play_sound(SoundType::Start);
+            // If user requested recording next input as trigger
+            if record_request_for_worker.load(Ordering::SeqCst) {
+                match event.event_type {
+                    EventType::KeyPress(k) => {
+                        if let Ok(mut guard) = current_trigger_for_worker.lock() {
+                            *guard = Trigger::Key(k);
+                        }
+                        record_request_for_worker.store(false, Ordering::SeqCst);
+                        println!("Set trigger (KeyPress) to {:?}", k);
+                        continue;
                     }
-
-                    let process_result = {
-                        match get_clipboard_content() {
-                            Ok(original_content) => process_clipboard_and_paste(
-                                original_content,
-                                &args_clone_for_worker,
-                                &rt,
-                            ),
-                            Err(e) => {
-                                eprintln!("ERROR getting clipboard content: {:?}", e);
-                                Err(e)
-                            }
+                    EventType::ButtonPress(b) => {
+                        if let Ok(mut guard) = current_trigger_for_worker.lock() {
+                            *guard = Trigger::Mouse(b);
                         }
-                    };
-
-                    // Check result and play appropriate sound
-                    match process_result {
-                        Ok(_) => {
-                            // Play SUCCESS sound only if flag is set
-                            if args_clone_for_worker.beeps {
-                                play_sound(SoundType::Success);
-                            }
-                        }
-                        Err(e) => {
-                            // Always play ERROR sound
-                            play_sound(SoundType::Error);
-                            // Print error for visibility
-                            eprintln!("{}", e);
-                        }
+                        record_request_for_worker.store(false, Ordering::SeqCst);
+                        println!("Set trigger (ButtonPress) to {:?}", b);
+                        continue;
                     }
-
-                    println!("--- Worker ready for next trigger ---");
+                    _ => {}
                 }
+            }
+
+            let should_trigger = match event.event_type {
+                EventType::KeyPress(key) => {
+                    let guard = current_trigger_for_worker.lock().unwrap();
+                    matches!(*guard, Trigger::Key(k) if k == key)
+                }
+                EventType::ButtonPress(button) => {
+                    let guard = current_trigger_for_worker.lock().unwrap();
+                    matches!(*guard, Trigger::Mouse(b) if b == button)
+                }
+                _ => false,
+            };
+
+            if should_trigger {
+                println!("\n--- Trigger key pressed (received by worker) ---");
+
+                if args_clone_for_worker.beeps {
+                    play_sound(SoundType::Start);
+                }
+
+                let process_result = {
+                    match get_clipboard_content() {
+                        Ok(original_content) => process_clipboard_and_paste(
+                            original_content,
+                            &args_clone_for_worker,
+                            &rt,
+                        ),
+                        Err(e) => {
+                            eprintln!("ERROR getting clipboard content: {:?}", e);
+                            Err(e)
+                        }
+                    }
+                };
+
+                match process_result {
+                    Ok(_) => {
+                        if args_clone_for_worker.beeps {
+                            play_sound(SoundType::Success);
+                        }
+                    }
+                    Err(e) => {
+                        play_sound(SoundType::Error);
+                        eprintln!("{}", e);
+                    }
+                }
+
+                println!("--- Worker ready for next trigger ---");
             }
         }
         println!("Worker thread finished.");
@@ -612,7 +694,6 @@ fn main() -> Result<()> {
         return Err(anyhow!("Keyboard listener setup failed: {:?}", error));
     }
 
-    // Optional: Join worker handle
     worker_handle.join().expect("Worker thread panicked");
 
     Ok(())
