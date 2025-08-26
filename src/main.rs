@@ -798,16 +798,16 @@ fn main() -> Result<()> {
     // Spawn Worker Thread (Conditional Beeps)
     let worker_handle = thread::spawn(move || {
         // println!("Worker thread started.");
-        // let rt = match Runtime::new() {
-        //     Ok(rt) => rt,
-        //     Err(e) => {
-        //         eprintln!(
-        //             "FATAL: Failed to create Tokio runtime in worker thread: {}",
-        //             e
-        //         );
-        //         return;
-        //     }
-        // };
+        let rt = match Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!(
+                    "FATAL: Failed to create Tokio runtime in worker thread: {}",
+                    e
+                );
+                return;
+            }
+        };
 
         for event in event_rx {
             // print the event unless it's MouseMove:
@@ -837,58 +837,58 @@ fn main() -> Result<()> {
                 }
             }
 
-            //     let should_trigger = match event.event_type {
-            //         EventType::KeyPress(key) => {
-            //             let guard = current_trigger_for_worker.lock().unwrap();
-            //             matches!(*guard, Trigger::Key(k) if k == key)
-            //         }
-            //         EventType::ButtonPress(button) => {
-            //             let guard = current_trigger_for_worker.lock().unwrap();
-            //             matches!(*guard, Trigger::Mouse(b) if b == button)
-            //         }
-            //         _ => false,
-            //     };
+            let should_trigger = match event.event_type {
+                EventType::KeyPress(key) => {
+                    let guard = current_trigger_for_worker.lock().unwrap();
+                    matches!(*guard, Trigger::Key(k) if k == key)
+                }
+                EventType::ButtonPress(button) => {
+                    let guard = current_trigger_for_worker.lock().unwrap();
+                    matches!(*guard, Trigger::Mouse(b) if b == button)
+                }
+                _ => false,
+            };
 
-            //     if should_trigger {
-            //         println!("\n--- Trigger key pressed (received by worker) ---");
+            if should_trigger {
+                println!("\n--- Trigger key pressed (received by worker) ---");
 
-            //         // Play START sound only if flag is set
-            //         if args_clone_for_worker.beeps {
-            //             play_sound(SoundType::Start);
-            //         }
+                // Play START sound only if flag is set
+                if args_clone_for_worker.beeps {
+                    play_sound(SoundType::Start);
+                }
 
-            //         let process_result = {
-            //             match get_clipboard_content() {
-            //                 Ok(original_content) => process_clipboard_and_paste(
-            //                     original_content,
-            //                     &args_clone_for_worker,
-            //                     &rt,
-            //                 ),
-            //                 Err(e) => {
-            //                     eprintln!("ERROR getting clipboard content: {:?}", e);
-            //                     Err(e)
-            //                 }
-            //             }
-            //         };
+                let process_result = {
+                    match get_clipboard_content() {
+                        Ok(original_content) => process_clipboard_and_paste(
+                            original_content,
+                            &args_clone_for_worker,
+                            &rt,
+                        ),
+                        Err(e) => {
+                            eprintln!("ERROR getting clipboard content: {:?}", e);
+                            Err(e)
+                        }
+                    }
+                };
 
-            //         // Check result and play appropriate sound
-            //         match process_result {
-            //             Ok(_) => {
-            //                 // Play SUCCESS sound only if flag is set
-            //                 if args_clone_for_worker.beeps {
-            //                     play_sound(SoundType::Success);
-            //                 }
-            //             }
-            //             Err(e) => {
-            //                 // Always play ERROR sound
-            //                 play_sound(SoundType::Error);
-            //                 // Print error for visibility
-            //                 eprintln!("{}", e);
-            //             }
-            //         }
+                // Check result and play appropriate sound
+                match process_result {
+                    Ok(_) => {
+                        // Play SUCCESS sound only if flag is set
+                        if args_clone_for_worker.beeps {
+                            play_sound(SoundType::Success);
+                        }
+                    }
+                    Err(e) => {
+                        // Always play ERROR sound
+                        play_sound(SoundType::Error);
+                        // Print error for visibility
+                        eprintln!("{}", e);
+                    }
+                }
 
-            //         println!("--- Worker ready for next trigger ---");
-            //     }
+                println!("--- Worker ready for next trigger ---");
+            }
         }
         println!("Worker thread finished.");
     });
