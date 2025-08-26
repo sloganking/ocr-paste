@@ -89,6 +89,95 @@ enum SoundType {
     Error,
 }
 
+// Map egui key events to rdev keys for trigger recording inside the GUI
+fn map_egui_key_to_ptt(key: egui::Key) -> Option<PTTKey> {
+    use egui::Key as EK;
+    match key {
+        // Function keys
+        EK::F1 => Some(PTTKey::F1),
+        EK::F2 => Some(PTTKey::F2),
+        EK::F3 => Some(PTTKey::F3),
+        EK::F4 => Some(PTTKey::F4),
+        EK::F5 => Some(PTTKey::F5),
+        EK::F6 => Some(PTTKey::F6),
+        EK::F7 => Some(PTTKey::F7),
+        EK::F8 => Some(PTTKey::F8),
+        EK::F9 => Some(PTTKey::F9),
+        EK::F10 => Some(PTTKey::F10),
+        EK::F11 => Some(PTTKey::F11),
+        EK::F12 => Some(PTTKey::F12),
+        // Extended function keys if egui provides them
+        EK::F13 => Some(PTTKey::F13),
+        EK::F14 => Some(PTTKey::F14),
+        EK::F15 => Some(PTTKey::F15),
+        EK::F16 => Some(PTTKey::F16),
+        EK::F17 => Some(PTTKey::F17),
+        EK::F18 => Some(PTTKey::F18),
+        EK::F19 => Some(PTTKey::F19),
+        EK::F20 => Some(PTTKey::F20),
+        // Some egui versions may not expose F21–F24
+
+        // Letters
+        EK::A => Some(PTTKey::KeyA),
+        EK::B => Some(PTTKey::KeyB),
+        EK::C => Some(PTTKey::KeyC),
+        EK::D => Some(PTTKey::KeyD),
+        EK::E => Some(PTTKey::KeyE),
+        EK::F => Some(PTTKey::KeyF),
+        EK::G => Some(PTTKey::KeyG),
+        EK::H => Some(PTTKey::KeyH),
+        EK::I => Some(PTTKey::KeyI),
+        EK::J => Some(PTTKey::KeyJ),
+        EK::K => Some(PTTKey::KeyK),
+        EK::L => Some(PTTKey::KeyL),
+        EK::M => Some(PTTKey::KeyM),
+        EK::N => Some(PTTKey::KeyN),
+        EK::O => Some(PTTKey::KeyO),
+        EK::P => Some(PTTKey::KeyP),
+        EK::Q => Some(PTTKey::KeyQ),
+        EK::R => Some(PTTKey::KeyR),
+        EK::S => Some(PTTKey::KeyS),
+        EK::T => Some(PTTKey::KeyT),
+        EK::U => Some(PTTKey::KeyU),
+        EK::V => Some(PTTKey::KeyV),
+        EK::W => Some(PTTKey::KeyW),
+        EK::X => Some(PTTKey::KeyX),
+        EK::Y => Some(PTTKey::KeyY),
+        EK::Z => Some(PTTKey::KeyZ),
+
+        // Digits (top row)
+        EK::Num0 => Some(PTTKey::Num0),
+        EK::Num1 => Some(PTTKey::Num1),
+        EK::Num2 => Some(PTTKey::Num2),
+        EK::Num3 => Some(PTTKey::Num3),
+        EK::Num4 => Some(PTTKey::Num4),
+        EK::Num5 => Some(PTTKey::Num5),
+        EK::Num6 => Some(PTTKey::Num6),
+        EK::Num7 => Some(PTTKey::Num7),
+        EK::Num8 => Some(PTTKey::Num8),
+        EK::Num9 => Some(PTTKey::Num9),
+
+        // Navigation and control
+        EK::Enter => Some(PTTKey::Return),
+        EK::Space => Some(PTTKey::Space),
+        EK::Backspace => Some(PTTKey::Backspace),
+        EK::Tab => Some(PTTKey::Tab),
+        EK::Escape => Some(PTTKey::Escape),
+        EK::Insert => Some(PTTKey::Insert),
+        EK::Home => Some(PTTKey::Home),
+        EK::End => Some(PTTKey::End),
+        EK::PageUp => Some(PTTKey::PageUp),
+        EK::PageDown => Some(PTTKey::PageDown),
+        EK::ArrowUp => Some(PTTKey::UpArrow),
+        EK::ArrowDown => Some(PTTKey::DownArrow),
+        EK::ArrowLeft => Some(PTTKey::LeftArrow),
+        EK::ArrowRight => Some(PTTKey::RightArrow),
+
+        // Unknown / not mapped
+        _ => None,
+    }
+}
+
 // --- Helper: Play Sound (Windows Version) ---
 fn play_sound(sound: SoundType) {
     let (freq_hz, dur_ms) = match sound {
@@ -556,6 +645,54 @@ impl eframe::App for SettingsApp {
                 if ui.button("Cancel").clicked() {
                     self.is_recording = false;
                     self.record_request.store(false, Ordering::SeqCst);
+                }
+
+                // Capture next egui input while recording and map to rdev trigger
+                let events = ctx.input(|i| i.events.clone());
+                for ev in events {
+                    match ev {
+                        egui::Event::Key {
+                            key,
+                            pressed,
+                            repeat,
+                            ..
+                        } => {
+                            if pressed && !repeat {
+                                if let Some(ptt) = map_egui_key_to_ptt(key) {
+                                    let rkey: Key = ptt.into();
+                                    if let Ok(mut guard) = self.shared_trigger.lock() {
+                                        *guard = Trigger::Key(rkey);
+                                        self.last_set = Some(*guard);
+                                    }
+                                    self.is_recording = false;
+                                    self.record_request.store(false, Ordering::SeqCst);
+                                    break;
+                                }
+                            }
+                        }
+                        egui::Event::PointerButton {
+                            button, pressed, ..
+                        } => {
+                            if pressed {
+                                let rbutton = match button {
+                                    egui::PointerButton::Primary => Button::Left,
+                                    egui::PointerButton::Secondary => Button::Right,
+                                    egui::PointerButton::Middle => Button::Middle,
+                                    // Map extras to Unknown codes 4/5 for lack of exact mapping
+                                    egui::PointerButton::Extra1 => Button::Unknown(4),
+                                    egui::PointerButton::Extra2 => Button::Unknown(5),
+                                };
+                                if let Ok(mut guard) = self.shared_trigger.lock() {
+                                    *guard = Trigger::Mouse(rbutton);
+                                    self.last_set = Some(*guard);
+                                }
+                                self.is_recording = false;
+                                self.record_request.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
 
