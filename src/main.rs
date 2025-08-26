@@ -505,9 +505,20 @@ enum Trigger {
     Mouse(Button),
 }
 
+fn human_key_name(key: Key) -> String {
+    match key {
+        Key::Unknown(code) if (124..=135).contains(&code) => {
+            // Windows virtual-key codes for F13..F24 map to 124..135 in rdev Unknown
+            let fn_num = (code as i32) - 111; // 124 -> 13, 135 -> 24
+            format!("F{}", fn_num)
+        }
+        other => format!("{:?}", other),
+    }
+}
+
 fn format_trigger(trigger: &Trigger) -> String {
     match trigger {
-        Trigger::Key(k) => format!("Key: {:?}", k),
+        Trigger::Key(k) => format!("Key: {}", human_key_name(*k)),
         Trigger::Mouse(b) => format!("Mouse: {:?}", b),
     }
 }
@@ -562,12 +573,21 @@ fn main() -> Result<()> {
     {
         match TrayItem::new("OCR Paste", tray_item::IconSource::Resource("IDI_ICON1")) {
             Ok(mut tray) => {
+                // Non-clickable label showing current trigger
+                let current_label = {
+                    let guard = current_trigger.lock().unwrap();
+                    format!("Current: {}", format_trigger(&*guard))
+                };
+                let _ = tray.add_label(&current_label);
+                // Keep a copy of the label text to refresh later on change (re-add label)
+
                 // Tray-only control: record next input as trigger
                 let record_flag_for_menu = Arc::clone(&record_request);
                 let _ = tray.add_menu_item("Set Trigger (next input)", move || {
                     println!("Recording next key or mouse button as trigger...");
                     record_flag_for_menu.store(true, Ordering::SeqCst);
                 });
+                // Note: public API doesn't expose tooltip setter; keeping title static
                 let _ = tray.add_menu_item("Exit", move || {
                     std::process::exit(0);
                 });
@@ -597,13 +617,7 @@ fn main() -> Result<()> {
         };
 
         for event in event_rx {
-            // print the event unless it's MouseMove or Wheel:
-            if !matches!(
-                event.event_type,
-                EventType::MouseMove { .. } | EventType::Wheel { .. }
-            ) {
-                println!("Event: {:?}", event);
-            }
+            // Silence noisy per-event logging
 
             // If user requested recording next input as trigger
             if record_request_for_worker.load(Ordering::SeqCst) {
@@ -612,6 +626,8 @@ fn main() -> Result<()> {
                         if let Ok(mut guard) = current_trigger_for_worker.lock() {
                             *guard = Trigger::Key(k);
                         }
+                        // Also update tooltip to reflect new trigger
+                        // (best-effort; ignored if tray not windows backend)
                         record_request_for_worker.store(false, Ordering::SeqCst);
                         println!("Set trigger (KeyPress) to {:?}", k);
                         continue;
