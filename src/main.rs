@@ -2,7 +2,6 @@
 
 use anyhow::{anyhow, Context as AnyhowContext, Result};
 use clap::Parser;
-use clap::ValueEnum;
 use clipboard_win::{formats, get_clipboard, Clipboard, Setter};
 use dotenvy;
 // Use winapi import
@@ -27,7 +26,6 @@ mod transcribe;
 
 use async_openai::{config::OpenAIConfig, Client};
 use default_device_sink::DefaultDeviceSink;
-use eframe::egui;
 use rodio::source::{SineWave, Source};
 use rodio::Decoder;
 use std::io::{BufReader, Cursor};
@@ -98,116 +96,7 @@ enum SoundType {
     Error,
 }
 
-// Control messages for the Settings window
-enum GuiMsg {
-    Show,
-}
-
-// Map egui key events to rdev keys for trigger recording inside the GUI
-fn map_egui_key_to_ptt(key: egui::Key) -> Option<PTTKey> {
-    use egui::Key as EK;
-    match key {
-        // Function keys
-        EK::F1 => Some(PTTKey::F1),
-        EK::F2 => Some(PTTKey::F2),
-        EK::F3 => Some(PTTKey::F3),
-        EK::F4 => Some(PTTKey::F4),
-        EK::F5 => Some(PTTKey::F5),
-        EK::F6 => Some(PTTKey::F6),
-        EK::F7 => Some(PTTKey::F7),
-        EK::F8 => Some(PTTKey::F8),
-        EK::F9 => Some(PTTKey::F9),
-        EK::F10 => Some(PTTKey::F10),
-        EK::F11 => Some(PTTKey::F11),
-        EK::F12 => Some(PTTKey::F12),
-        // Extended function keys if egui provides them
-        EK::F13 => Some(PTTKey::F13),
-        EK::F14 => Some(PTTKey::F14),
-        EK::F15 => Some(PTTKey::F15),
-        EK::F16 => Some(PTTKey::F16),
-        EK::F17 => Some(PTTKey::F17),
-        EK::F18 => Some(PTTKey::F18),
-        EK::F19 => Some(PTTKey::F19),
-        EK::F20 => Some(PTTKey::F20),
-        // Some egui versions may not expose F21–F24
-
-        // Letters
-        EK::A => Some(PTTKey::KeyA),
-        EK::B => Some(PTTKey::KeyB),
-        EK::C => Some(PTTKey::KeyC),
-        EK::D => Some(PTTKey::KeyD),
-        EK::E => Some(PTTKey::KeyE),
-        EK::F => Some(PTTKey::KeyF),
-        EK::G => Some(PTTKey::KeyG),
-        EK::H => Some(PTTKey::KeyH),
-        EK::I => Some(PTTKey::KeyI),
-        EK::J => Some(PTTKey::KeyJ),
-        EK::K => Some(PTTKey::KeyK),
-        EK::L => Some(PTTKey::KeyL),
-        EK::M => Some(PTTKey::KeyM),
-        EK::N => Some(PTTKey::KeyN),
-        EK::O => Some(PTTKey::KeyO),
-        EK::P => Some(PTTKey::KeyP),
-        EK::Q => Some(PTTKey::KeyQ),
-        EK::R => Some(PTTKey::KeyR),
-        EK::S => Some(PTTKey::KeyS),
-        EK::T => Some(PTTKey::KeyT),
-        EK::U => Some(PTTKey::KeyU),
-        EK::V => Some(PTTKey::KeyV),
-        EK::W => Some(PTTKey::KeyW),
-        EK::X => Some(PTTKey::KeyX),
-        EK::Y => Some(PTTKey::KeyY),
-        EK::Z => Some(PTTKey::KeyZ),
-
-        // Digits (top row)
-        EK::Num0 => Some(PTTKey::Num0),
-        EK::Num1 => Some(PTTKey::Num1),
-        EK::Num2 => Some(PTTKey::Num2),
-        EK::Num3 => Some(PTTKey::Num3),
-        EK::Num4 => Some(PTTKey::Num4),
-        EK::Num5 => Some(PTTKey::Num5),
-        EK::Num6 => Some(PTTKey::Num6),
-        EK::Num7 => Some(PTTKey::Num7),
-        EK::Num8 => Some(PTTKey::Num8),
-        EK::Num9 => Some(PTTKey::Num9),
-
-        // Navigation and control
-        EK::Enter => Some(PTTKey::Return),
-        EK::Space => Some(PTTKey::Space),
-        EK::Backspace => Some(PTTKey::Backspace),
-        EK::Tab => Some(PTTKey::Tab),
-        EK::Escape => Some(PTTKey::Escape),
-        EK::Insert => Some(PTTKey::Insert),
-        EK::Home => Some(PTTKey::Home),
-        EK::End => Some(PTTKey::End),
-        EK::PageUp => Some(PTTKey::PageUp),
-        EK::PageDown => Some(PTTKey::PageDown),
-        EK::ArrowUp => Some(PTTKey::UpArrow),
-        EK::ArrowDown => Some(PTTKey::DownArrow),
-        EK::ArrowLeft => Some(PTTKey::LeftArrow),
-        EK::ArrowRight => Some(PTTKey::RightArrow),
-
-        // Unknown / not mapped
-        _ => None,
-    }
-}
-
-// --- Helper: Play Sound (Windows Version) ---
-fn play_sound(sound: SoundType) {
-    let (freq_hz, dur_ms) = match sound {
-        SoundType::Start => (880, 150),    // A5
-        SoundType::Success => (1047, 300), // C6 (rounded)
-        SoundType::Error => (262, 500),    // C4 (rounded)
-    };
-    unsafe {
-        // Beep returns 0 on failure, non-zero on success. We ignore the result.
-        let _ = Beep(freq_hz, dur_ms);
-    }
-    // Small delay to prevent sounds overlapping if triggered quickly
-    thread::sleep(Duration::from_millis(50));
-}
-
-// --- Audio Helpers ---
+// --- Audio Helpers and functions (unchanged below)...
 static TICK_BYTES: &[u8] = include_bytes!("../assets/tick.mp3");
 static FAILED_BYTES: &[u8] = include_bytes!("../assets/failed.mp3");
 
@@ -248,6 +137,18 @@ fn play_failure_sound() {
         );
     }
     sink.sleep_until_end();
+}
+
+fn play_sound(sound: SoundType) {
+    let (freq_hz, dur_ms) = match sound {
+        SoundType::Start => (880, 150),
+        SoundType::Success => (1047, 300),
+        SoundType::Error => (262, 500),
+    };
+    unsafe {
+        let _ = Beep(freq_hz, dur_ms);
+    }
+    thread::sleep(Duration::from_millis(50));
 }
 
 // --- Helper Functions (Full Implementations) ---
@@ -597,7 +498,7 @@ fn send_ctrl_v() -> Result<(), rdev::SimulateError> {
     Ok(())
 }
 
-// --- Trigger type and Settings GUI ---
+// --- Trigger type (tray-only configuration) ---
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Trigger {
     Key(Key),
@@ -611,213 +512,7 @@ fn format_trigger(trigger: &Trigger) -> String {
     }
 }
 
-// --- Persistent trigger storage (for separate settings process) ---
-fn trigger_store_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            let mut p = PathBuf::from(appdata);
-            p.push("ocrp");
-            let _ = std::fs::create_dir_all(&p);
-            p.push("trigger.txt");
-            return p;
-        }
-    }
-    let mut p = std::env::temp_dir();
-    p.push("ocrp_trigger.txt");
-    p
-}
-
-fn save_trigger_to_disk_key(ptt: PTTKey) {
-    let path = trigger_store_path();
-    let _ = std::fs::write(path, format!("key:{}", format!("{:?}", ptt)));
-}
-
-fn save_trigger_to_disk_mouse(button: Button) {
-    let path = trigger_store_path();
-    let label = match button {
-        Button::Left => "Left".to_string(),
-        Button::Right => "Right".to_string(),
-        Button::Middle => "Middle".to_string(),
-        Button::Unknown(code) => format!("Unknown({})", code),
-    };
-    let _ = std::fs::write(path, format!("mouse:{}", label));
-}
-
-fn load_trigger_from_disk() -> Option<Trigger> {
-    let path = trigger_store_path();
-    let data = std::fs::read_to_string(path).ok()?;
-    let mut parts = data.splitn(2, ':');
-    let kind = parts.next()?;
-    let val = parts.next()?.trim();
-    match kind {
-        "key" => match PTTKey::from_str(val, true) {
-            Ok(ptt) => {
-                let rkey: Key = ptt.into();
-                Some(Trigger::Key(rkey))
-            }
-            Err(_) => None,
-        },
-        "mouse" => {
-            let button = match val {
-                "Left" => Button::Left,
-                "Right" => Button::Right,
-                "Middle" => Button::Middle,
-                other if other.starts_with("Unknown(") && other.ends_with(")") => {
-                    let inner = &other[8..other.len() - 1];
-                    inner.parse::<u8>().map(Button::Unknown).ok()?
-                }
-                _ => return None,
-            };
-            Some(Trigger::Mouse(button))
-        }
-        _ => None,
-    }
-}
-
-struct SettingsApp {
-    shared_trigger: Arc<Mutex<Trigger>>,
-    is_recording: bool,
-    last_set: Option<Trigger>,
-    record_request: Arc<AtomicBool>,
-    gui_rx: mpsc::Receiver<GuiMsg>,
-    initialized: bool,
-}
-
-impl SettingsApp {
-    fn new(
-        shared_trigger: Arc<Mutex<Trigger>>,
-        record_request: Arc<AtomicBool>,
-        gui_rx: mpsc::Receiver<GuiMsg>,
-    ) -> Self {
-        Self {
-            shared_trigger,
-            is_recording: false,
-            last_set: None,
-            record_request,
-            gui_rx,
-            initialized: false,
-        }
-    }
-}
-
-impl eframe::App for SettingsApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Recording handled by worker via global hook; GUI only toggles record flag
-
-        // Ensure we keep ticking even when hidden so we can process Show messages
-        ctx.request_repaint_after(Duration::from_millis(200));
-
-        // Start visible initially; we only hide on close and show on demand
-
-        // Intercept OS close (X) → hide instead of quitting the event loop
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-
-        // Handle show requests from the tray
-        while let Ok(msg) = self.gui_rx.try_recv() {
-            match msg {
-                GuiMsg::Show => {
-                    // Ensure a sensible size and make visible/focused
-                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        520.0, 260.0,
-                    )));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-            }
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("OCR Paste Settings");
-            ui.add_space(8.0);
-
-            // Current trigger display
-            let current = {
-                let guard = self.shared_trigger.lock().unwrap();
-                format_trigger(&*guard)
-            };
-            ui.label(format!("Current trigger: {}", current));
-
-            if let Some(tr) = self.last_set {
-                ui.label(format!("Last set: {}", format_trigger(&tr)));
-            }
-
-            ui.add_space(10.0);
-            if !self.is_recording {
-                if ui.button("Set trigger...").clicked() {
-                    self.is_recording = true;
-                    self.record_request.store(true, Ordering::SeqCst);
-                }
-            } else {
-                ui.colored_label(egui::Color32::YELLOW, "Press any key or mouse button...");
-                if ui.button("Cancel").clicked() {
-                    self.is_recording = false;
-                    self.record_request.store(false, Ordering::SeqCst);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                }
-
-                // Capture next egui input while recording and map to rdev trigger
-                let events = ctx.input(|i| i.events.clone());
-                for ev in events {
-                    match ev {
-                        egui::Event::Key {
-                            key,
-                            pressed,
-                            repeat,
-                            ..
-                        } => {
-                            if pressed && !repeat {
-                                if let Some(ptt) = map_egui_key_to_ptt(key) {
-                                    let rkey: Key = ptt.into();
-                                    if let Ok(mut guard) = self.shared_trigger.lock() {
-                                        *guard = Trigger::Key(rkey);
-                                        self.last_set = Some(*guard);
-                                    }
-                                    save_trigger_to_disk_key(ptt);
-                                    self.is_recording = false;
-                                    self.record_request.store(false, Ordering::SeqCst);
-                                    break;
-                                }
-                            }
-                        }
-                        egui::Event::PointerButton {
-                            button, pressed, ..
-                        } => {
-                            if pressed {
-                                let rbutton = match button {
-                                    egui::PointerButton::Primary => Button::Left,
-                                    egui::PointerButton::Secondary => Button::Right,
-                                    egui::PointerButton::Middle => Button::Middle,
-                                    // Map extras to Unknown codes 4/5 for lack of exact mapping
-                                    egui::PointerButton::Extra1 => Button::Unknown(4),
-                                    egui::PointerButton::Extra2 => Button::Unknown(5),
-                                };
-                                if let Ok(mut guard) = self.shared_trigger.lock() {
-                                    *guard = Trigger::Mouse(rbutton);
-                                    self.last_set = Some(*guard);
-                                }
-                                save_trigger_to_disk_mouse(rbutton);
-                                self.is_recording = false;
-                                self.record_request.store(false, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            ui.add_space(12.0);
-            ui.label("Close this window after setting the trigger.");
-        });
-    }
-}
-
-// --- Main Function (Conditional Sound Calls) ---
+// --- Main Function (Tray-only settings) ---
 fn main() -> Result<()> {
     // Load .env file
     match dotenvy::dotenv() {
@@ -840,49 +535,17 @@ fn main() -> Result<()> {
         }
     }
 
-    // If launched as settings-only, run the GUI and exit
-    if args.settings {
-        let default_key = easy_rdev_key::PTTKey::F13;
-        let trigger_for_gui = Arc::new(Mutex::new(Trigger::Key(default_key.into())));
-        let record_for_gui = Arc::new(AtomicBool::new(false));
-        let (_tx, rx) = mpsc::channel::<GuiMsg>();
-        let mut native_options = eframe::NativeOptions::default();
-        native_options.event_loop_builder = Some(Box::new(|builder| {
-            #[cfg(target_os = "windows")]
-            {
-                use winit::platform::windows::EventLoopBuilderExtWindows;
-                builder.with_any_thread(true);
-            }
-        }));
-        let _ = eframe::run_native(
-            "OCR Paste Settings",
-            native_options,
-            Box::new(move |_cc| Box::new(SettingsApp::new(trigger_for_gui, record_for_gui, rx))),
-        );
-        return Ok(());
-    }
-
-    // Load persisted trigger if available; fall back to CLI/default F13
-    let target_key: rdev::Key = match load_trigger_from_disk() {
-        Some(Trigger::Key(k)) => k,
-        _ => args
-            .trigger_key
-            .unwrap_or(easy_rdev_key::PTTKey::F13)
-            .into(),
-    };
+    // Ignore --settings now that GUI is removed; start normally
+    let target_key: rdev::Key = args.trigger_key.unwrap_or(PTTKey::F13).into();
     let current_trigger = Arc::new(Mutex::new(Trigger::Key(target_key)));
     let current_trigger_for_worker = Arc::clone(&current_trigger);
-    let current_trigger_for_gui = Arc::clone(&current_trigger);
     let record_request = Arc::new(AtomicBool::new(false));
     let record_request_for_worker = Arc::clone(&record_request);
-    let record_request_for_gui = Arc::clone(&record_request);
-    let args_clone_for_worker = args.clone(); // Clone includes the 'beeps' flag state
 
     // Startup Info
     println!("Clipboard Processor Started.");
     println!("Trigger Key: {:?}", target_key);
-    println!("Optional Beeps Enabled: {}", args.beeps); // Log beep flag status
-                                                        // ... (rest of startup messages) ...
+    println!("Optional Beeps Enabled: {}", args.beeps);
     if args.openai_api_key.is_some() { /* ... */
     } else { /* ... */
     }
@@ -891,7 +554,8 @@ fn main() -> Result<()> {
         "Press '{:?}' when an image OR a single audio/video file is in the clipboard to process.",
         target_key
     );
-    // Create system tray with embedded icon resource (built via build.rs)
+
+    // Create system tray
     #[cfg(target_os = "windows")]
     let mut _tray: Option<TrayItem> = None;
     #[cfg(target_os = "windows")]
@@ -899,17 +563,16 @@ fn main() -> Result<()> {
         match TrayItem::new("OCR Paste", tray_item::IconSource::Resource("IDI_ICON1")) {
             Ok(mut tray) => {
                 // Tray-only control: record next input as trigger
-                let record_flag_for_menu = Arc::clone(&record_request_for_gui);
+                let record_flag_for_menu = Arc::clone(&record_request);
                 let _ = tray.add_menu_item("Set Trigger (next input)", move || {
                     println!("Recording next key or mouse button as trigger...");
                     record_flag_for_menu.store(true, Ordering::SeqCst);
                 });
                 let _ = tray.add_menu_item("Exit", move || {
-                    // Immediate exit on menu click
                     std::process::exit(0);
                 });
                 println!("System tray ready. Right-click for options (Exit).\n");
-                _tray = Some(tray); // keep alive for program lifetime
+                _tray = Some(tray);
             }
             Err(e) => {
                 eprintln!("Warning: Failed to create system tray: {}", e);
@@ -919,9 +582,9 @@ fn main() -> Result<()> {
 
     let (event_tx, event_rx): (Sender<Event>, Receiver<Event>) = mpsc::channel();
 
-    // Spawn Worker Thread (Conditional Beeps)
+    // Spawn Worker Thread
+    let args_clone_for_worker = args.clone();
     let worker_handle = thread::spawn(move || {
-        // println!("Worker thread started.");
         let rt = match Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
@@ -942,6 +605,7 @@ fn main() -> Result<()> {
                 println!("Event: {:?}", event);
             }
 
+            // If user requested recording next input as trigger
             if record_request_for_worker.load(Ordering::SeqCst) {
                 match event.event_type {
                     EventType::KeyPress(k) => {
@@ -979,7 +643,6 @@ fn main() -> Result<()> {
             if should_trigger {
                 println!("\n--- Trigger key pressed (received by worker) ---");
 
-                // Play START sound only if flag is set
                 if args_clone_for_worker.beeps {
                     play_sound(SoundType::Start);
                 }
@@ -998,18 +661,14 @@ fn main() -> Result<()> {
                     }
                 };
 
-                // Check result and play appropriate sound
                 match process_result {
                     Ok(_) => {
-                        // Play SUCCESS sound only if flag is set
                         if args_clone_for_worker.beeps {
                             play_sound(SoundType::Success);
                         }
                     }
                     Err(e) => {
-                        // Always play ERROR sound
                         play_sound(SoundType::Error);
-                        // Print error for visibility
                         eprintln!("{}", e);
                     }
                 }
@@ -1035,7 +694,6 @@ fn main() -> Result<()> {
         return Err(anyhow!("Keyboard listener setup failed: {:?}", error));
     }
 
-    // Optional: Join worker handle
     worker_handle.join().expect("Worker thread panicked");
 
     Ok(())
