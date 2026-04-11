@@ -4,8 +4,6 @@ use anyhow::{anyhow, Context as AnyhowContext, Result};
 use clap::Parser;
 use clipboard_win::{formats, get_clipboard, Clipboard, Setter};
 use dotenvy;
-// Use winapi import
-use winapi::um::utilapiset::Beep;
 
 use bardecoder;
 use image::ImageFormat;
@@ -89,14 +87,7 @@ enum ClipboardContent {
     FileList(Vec<String>),
 }
 
-// --- Sound Type Enum ---
-enum SoundType {
-    Start,
-    Success,
-    Error,
-}
-
-// --- Audio Helpers and functions (unchanged below)...
+// --- Audio Helpers ---
 static TICK_BYTES: &[u8] = include_bytes!("../assets/tick.mp3");
 static FAILED_BYTES: &[u8] = include_bytes!("../assets/failed.mp3");
 
@@ -125,6 +116,29 @@ fn tick_loop(stop_rx: mpsc::Receiver<()>) {
     }
 }
 
+/// Short high-pitched beep on trigger key press.
+fn play_beep() {
+    let sink = DefaultDeviceSink::new();
+    sink.append(
+        SineWave::new(880.0)
+            .take_duration(Duration::from_millis(120))
+            .amplify(0.20),
+    );
+    sink.sleep_until_end();
+}
+
+/// Lower-pitched boop on successful completion.
+fn play_boop() {
+    let sink = DefaultDeviceSink::new();
+    sink.append(
+        SineWave::new(1047.0)
+            .take_duration(Duration::from_millis(200))
+            .amplify(0.20),
+    );
+    sink.sleep_until_end();
+}
+
+/// Play the failure / error sound from the bundled mp3.
 fn play_failure_sound() {
     let sink = DefaultDeviceSink::new();
     if let Ok(decoder) = Decoder::new(BufReader::new(Cursor::new(FAILED_BYTES))) {
@@ -137,18 +151,6 @@ fn play_failure_sound() {
         );
     }
     sink.sleep_until_end();
-}
-
-fn play_sound(sound: SoundType) {
-    let (freq_hz, dur_ms) = match sound {
-        SoundType::Start => (880, 150),
-        SoundType::Success => (1047, 300),
-        SoundType::Error => (262, 500),
-    };
-    unsafe {
-        let _ = Beep(freq_hz, dur_ms);
-    }
-    thread::sleep(Duration::from_millis(50));
 }
 
 // --- Helper Functions (Full Implementations) ---
@@ -313,28 +315,17 @@ fn process_clipboard_and_paste(
                 let config = OpenAIConfig::new().with_api_key(api_key);
                 let client = Client::with_config(config);
 
-                let (tick_tx, tick_rx) = mpsc::channel();
-                let tick_handle = thread::spawn(move || tick_loop(tick_rx));
-
                 let transcription_result = rt.block_on(transcribe::trans::transcribe(
                     &client,
                     &audio_path_to_transcribe,
                 ));
 
-                let _ = tick_tx.send(());
-                let _ = tick_handle.join();
-
-                transcription_result
-                    .with_context(|| {
-                        format!(
-                            "Audio transcription failed for: {:?}",
-                            audio_path_to_transcribe
-                        )
-                    })
-                    .map_err(|e| {
-                        play_failure_sound();
-                        e
-                    })
+                transcription_result.with_context(|| {
+                    format!(
+                        "Audio transcription failed for: {:?}",
+                        audio_path_to_transcribe
+                    )
+                })
             } else {
                 Err(anyhow!(
                     "Clipboard contains {} files. Only single audio/video file processing is supported.",
@@ -644,8 +635,11 @@ fn main() -> Result<()> {
                 println!("\n--- Trigger key pressed (received by worker) ---");
 
                 if args_clone_for_worker.beeps {
-                    play_sound(SoundType::Start);
+                    play_beep();
                 }
+
+                let (tick_tx, tick_rx) = mpsc::channel();
+                let tick_handle = thread::spawn(move || tick_loop(tick_rx));
 
                 let process_result = {
                     match get_clipboard_content() {
@@ -661,14 +655,17 @@ fn main() -> Result<()> {
                     }
                 };
 
+                let _ = tick_tx.send(());
+                let _ = tick_handle.join();
+
                 match process_result {
                     Ok(_) => {
                         if args_clone_for_worker.beeps {
-                            play_sound(SoundType::Success);
+                            play_boop();
                         }
                     }
                     Err(e) => {
-                        play_sound(SoundType::Error);
+                        play_failure_sound();
                         eprintln!("{}", e);
                     }
                 }

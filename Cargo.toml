@@ -22,9 +22,6 @@ tokio = { version = "1", features = [
 ] } # Use "full" or "rt-multi-thread", "macros"
 tempfile = "3.10.1"
 dotenvy = "0.15.7"
-winapi = { version = "0.3.9", features = [
-    "utilapiset",
-] } # Ensure this line is present
 tray-item = "0.8.0"
 eframe = { version = "0.26", default-features = true }
 winit = "0.29"
